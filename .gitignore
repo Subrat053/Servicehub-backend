@@ -1,0 +1,8 @@
+node_modules
+uploads/*
+!uploads/.gitkeep
+
+# Environment variables – never commit these
+.env
+.env.local
+# .env.example is safe to commit
