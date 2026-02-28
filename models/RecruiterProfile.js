@@ -7,6 +7,7 @@ const recruiterProfileSchema = new mongoose.Schema({
   city: { type: String, default: '', trim: true },
   state: { type: String, default: '', trim: true },
   description: { type: String, default: '' },
+  skillsNeeded: [{ type: String, trim: true }],   // skills the recruiter wants to hire for
 
   // Unlock pack
   currentPlan: { type: String, enum: ['free', 'starter', 'business', 'enterprise'], default: 'free' },

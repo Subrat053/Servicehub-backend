@@ -22,6 +22,12 @@ const {
   deleteProvider,
   getPaymentSettings,
   updatePaymentSettings,
+  getSkillCategories,
+  createSkillCategory,
+  updateSkillCategory,
+  addSkillToCategory,
+  removeSkillFromCategory,
+  deleteSkillCategory,
 } = require('../controllers/adminController');
 const upload = require('../middleware/upload');
 
@@ -54,5 +60,13 @@ router.get('/payment-settings', getPaymentSettings);
 router.put('/payment-settings', updatePaymentSettings);
 router.get('/jobs', getAllJobs);
 router.post('/profile/photo', protect, authorize('admin'), upload.single('profilePhoto'), require('../controllers/adminController').uploadProfilePhoto);
+
+// Skill category management (admin)
+router.get('/skills', getSkillCategories);
+router.post('/skills', createSkillCategory);
+router.put('/skills/:id', updateSkillCategory);
+router.delete('/skills/:id', deleteSkillCategory);
+router.post('/skills/:id/skills', addSkillToCategory);
+router.delete('/skills/:id/skills/:skillId', removeSkillFromCategory);
 
 module.exports = router;

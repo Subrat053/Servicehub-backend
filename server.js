@@ -18,7 +18,7 @@ connectDB();
 // Security Middleware
 app.use(helmet());
 app.use(cors({
-  origin: process.env.FRONTEND_URL || 'http://localhost:5173',
+  origin: true,
   credentials: true,
 }));
 
@@ -43,6 +43,18 @@ app.use(express.urlencoded({ extended: true }));
 
 // Serve uploads
 app.use('/uploads', express.static(require('path').join(__dirname, 'uploads')));
+
+// Public skill categories (no auth required)
+app.get('/api/skills', async (req, res) => {
+  try {
+    const SkillCategory = require('./models/SkillCategory');
+    const cats = await SkillCategory.find({ isActive: true }).sort({ tier: 1, sortOrder: 1 });
+    res.json(cats);
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
 // Routes
 app.use('/api/auth', authRoutes);
 app.use('/api/provider', providerRoutes);

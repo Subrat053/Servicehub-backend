@@ -47,7 +47,7 @@ const getDashboard = async (req, res) => {
 // @route   PUT /api/recruiter/profile
 const updateProfile = async (req, res) => {
   try {
-    const { companyName, companyType, city, state, description } = req.body;
+    const { companyName, companyType, city, state, description, skillsNeeded } = req.body;
     const profile = await RecruiterProfile.findOne({ user: req.user._id });
     if (!profile) return res.status(404).json({ message: 'Profile not found' });
 
@@ -56,6 +56,7 @@ const updateProfile = async (req, res) => {
     if (city !== undefined) profile.city = city;
     if (state !== undefined) profile.state = state;
     if (description !== undefined) profile.description = description;
+    if (Array.isArray(skillsNeeded)) profile.skillsNeeded = skillsNeeded;
 
     if (req.body.name) {
       await User.findByIdAndUpdate(req.user._id, { name: req.body.name });

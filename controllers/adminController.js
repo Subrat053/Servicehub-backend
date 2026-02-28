@@ -1,4 +1,5 @@
 const User = require('../models/User');
+const SkillCategory = require('../models/SkillCategory');
 const ProviderProfile = require('../models/ProviderProfile');
 const RecruiterProfile = require('../models/RecruiterProfile');
 const JobPost = require('../models/JobPost');
@@ -420,6 +421,88 @@ const deleteProvider = async (req, res) => {
   }
 };
 
+// ─── Skill Categories ─────────────────────────────────────────────────────────
+
+// @desc  GET all skill categories (public)
+// @route GET /api/admin/skills  (admin)  |  GET /api/skills (public route added in server.js)
+const getSkillCategories = async (req, res) => {
+  try {
+    const cats = await SkillCategory.find({ isActive: true }).sort({ tier: 1, sortOrder: 1 });
+    res.json(cats);
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+};
+
+// @desc  CREATE a new skill category
+// @route POST /api/admin/skills
+const createSkillCategory = async (req, res) => {
+  try {
+    const cat = await SkillCategory.create(req.body);
+    res.status(201).json(cat);
+  } catch (err) {
+    res.status(400).json({ message: err.message });
+  }
+};
+
+// @desc  UPDATE a skill category (name, icon, skills, sortOrder, isActive)
+// @route PUT /api/admin/skills/:id
+const updateSkillCategory = async (req, res) => {
+  try {
+    const cat = await SkillCategory.findByIdAndUpdate(req.params.id, req.body, { new: true, runValidators: true });
+    if (!cat) return res.status(404).json({ message: 'Category not found' });
+    res.json(cat);
+  } catch (err) {
+    res.status(400).json({ message: err.message });
+  }
+};
+
+// @desc  ADD a skill to a category
+// @route POST /api/admin/skills/:id/skills
+const addSkillToCategory = async (req, res) => {
+  try {
+    const { name } = req.body;
+    if (!name) return res.status(400).json({ message: 'name required' });
+    const slug = name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '');
+    const cat = await SkillCategory.findByIdAndUpdate(
+      req.params.id,
+      { $push: { skills: { name, slug, isActive: true } } },
+      { new: true }
+    );
+    if (!cat) return res.status(404).json({ message: 'Category not found' });
+    res.json(cat);
+  } catch (err) {
+    res.status(400).json({ message: err.message });
+  }
+};
+
+// @desc  REMOVE a skill from a category
+// @route DELETE /api/admin/skills/:id/skills/:skillId
+const removeSkillFromCategory = async (req, res) => {
+  try {
+    const cat = await SkillCategory.findByIdAndUpdate(
+      req.params.id,
+      { $pull: { skills: { _id: req.params.skillId } } },
+      { new: true }
+    );
+    if (!cat) return res.status(404).json({ message: 'Category not found' });
+    res.json(cat);
+  } catch (err) {
+    res.status(400).json({ message: err.message });
+  }
+};
+
+// @desc  DELETE a skill category
+// @route DELETE /api/admin/skills/:id
+const deleteSkillCategory = async (req, res) => {
+  try {
+    await SkillCategory.findByIdAndDelete(req.params.id);
+    res.json({ message: 'Deleted' });
+  } catch (err) {
+    res.status(400).json({ message: err.message });
+  }
+};
+
 module.exports = {
   getDashboard,
   getUsers,
@@ -443,4 +526,10 @@ module.exports = {
   deleteProvider,
   getPaymentSettings,
   updatePaymentSettings,
+  getSkillCategories,
+  createSkillCategory,
+  updateSkillCategory,
+  addSkillToCategory,
+  removeSkillFromCategory,
+  deleteSkillCategory,
 };
