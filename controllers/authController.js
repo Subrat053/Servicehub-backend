@@ -3,7 +3,7 @@ const ProviderProfile = require('../models/ProviderProfile');
 const RecruiterProfile = require('../models/RecruiterProfile');
 const Otp = require('../models/Otp');
 const generateToken = require('../utils/generateToken');
-const { generateOTP, sendPhoneOTP, sendEmailOTP, sendWhatsAppMessage, formatPhoneNumber } = require('../utils/messaging');
+const { generateOTP, sendPhoneOTP, sendEmailOTP, sendWhatsAppMessage } = require('../utils/messaging');
 
 // @desc    Register user with email
 // @route   POST /api/auth/register
@@ -20,7 +20,10 @@ const registerEmail = async (req, res) => {
 
     const userExists = await User.findOne({ email });
     if (userExists) {
-      return res.status(400).json({ message: 'User already exists with this email' });
+      return res.status(400).json({ 
+        message: `This email is already registered as a ${userExists.role}. Please login instead or use a different email.`,
+        existingRole: userExists.role
+      });
     }
 
     const user = await User.create({
@@ -115,9 +118,16 @@ const googleAuth = async (req, res) => {
     let user = await User.findOne({ email });
 
     if (user) {
-      // Existing user - login
+      // Existing user - login with their existing role
       if (user.isBlocked) {
         return res.status(403).json({ message: 'Account blocked' });
+      }
+      // If user provides a different role than registered, inform them
+      if (role && role !== user.role) {
+        return res.status(400).json({ 
+          message: `This email is already registered as a ${user.role}. Logging you in with your existing role.`,
+          existingRole: user.role
+        });
       }
       user.lastLogin = new Date();
       user.googleId = googleId;
@@ -176,40 +186,18 @@ const whatsappSendOtp = async (req, res) => {
     const { phone } = req.body;
     if (!phone) return res.status(400).json({ message: 'Phone number required' });
 
-    // Normalise to consistent format so rate-limit and lookup are reliable
-    const normalizedPhone = formatPhoneNumber(phone);
-
-    // Rate limit: max 3 OTP requests per phone per 10 minutes
-    const tenMinutesAgo = new Date(Date.now() - 10 * 60 * 1000);
-    const recentCount = await Otp.countDocuments({
-      identifier: normalizedPhone,
-      type: 'phone',
-      createdAt: { $gte: tenMinutesAgo },
-    });
-    if (recentCount >= 3) {
-      return res.status(429).json({
-        message: 'Too many OTP requests. Please wait 10 minutes before trying again.',
-      });
-    }
-
     const otp = generateOTP();
     await Otp.create({
-      identifier: normalizedPhone,
+      identifier: phone,
       otp,
       type: 'phone',
       expiresAt: new Date(Date.now() + 10 * 60 * 1000), // 10 min
     });
 
-    await sendPhoneOTP(normalizedPhone, otp);
-    res.json({ message: 'OTP sent to WhatsApp', phone: normalizedPhone });
+    await sendPhoneOTP(phone, otp);
+    res.json({ message: 'OTP sent to WhatsApp', phone });
   } catch (error) {
-    console.error('[whatsappSendOtp]', error.message);
-    if (error.message.includes('not configured')) {
-      return res.status(503).json({
-        message: 'WhatsApp service not configured. Contact support.',
-      });
-    }
-    res.status(500).json({ message: 'Failed to send OTP. Please try again.' });
+    res.status(500).json({ message: 'Server error', error: error.message });
   }
 };
 
@@ -220,10 +208,8 @@ const whatsappVerifyOtp = async (req, res) => {
     const { phone, otp, name, role } = req.body;
     if (!phone || !otp) return res.status(400).json({ message: 'Phone and OTP required' });
 
-    const normalizedPhone = formatPhoneNumber(phone);
-
     const otpRecord = await Otp.findOne({
-      identifier: normalizedPhone,
+      identifier: phone,
       otp,
       isUsed: false,
       expiresAt: { $gt: new Date() },
@@ -236,7 +222,7 @@ const whatsappVerifyOtp = async (req, res) => {
     otpRecord.isUsed = true;
     await otpRecord.save();
 
-    let user = await User.findOne({ phone: normalizedPhone });
+    let user = await User.findOne({ phone });
 
     if (user) {
       // Existing user
@@ -250,8 +236,8 @@ const whatsappVerifyOtp = async (req, res) => {
       }
       user = await User.create({
         name,
-        email: `${normalizedPhone}@whatsapp.servicehub.com`,
-        phone: normalizedPhone,
+        email: `${phone}@whatsapp.servicehub.com`,
+        phone,
         role,
         authProvider: 'whatsapp',
         isPhoneVerified: true,
