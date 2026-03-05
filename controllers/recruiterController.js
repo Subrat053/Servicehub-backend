@@ -73,11 +73,12 @@ const updateProfile = async (req, res) => {
 // @route   GET /api/recruiter/search?skill=&city=&rating=&experience=&verified=&page=&limit=
 const searchProviders = async (req, res) => {
   try {
-    const { skill, city, rating, experience, verified, page = 1, limit = 20 } = req.query;
+    const { skill, city, tier, rating, experience, verified, page = 1, limit = 20 } = req.query;
 
     const filter = {};
     if (skill) filter.skills = { $regex: skill, $options: 'i' };
     if (city) filter.city = { $regex: city, $options: 'i' };
+    if (tier) filter.tier = tier;
     if (rating) filter.rating = { $gte: parseFloat(rating) };
     if (experience) filter.experience = { $regex: experience, $options: 'i' };
     if (verified === 'true') filter.isVerified = true;

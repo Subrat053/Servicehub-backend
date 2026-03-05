@@ -24,7 +24,7 @@ const getMyProfile = async (req, res) => {
 const updateProfile = async (req, res) => {
   try {
     const {
-      skills, experience, city, state, languages,
+      skills, tier, experience, city, state, languages,
       description, portfolioLinks, photo, documents,
       whatsappAlerts,
     } = req.body;
@@ -42,6 +42,7 @@ const updateProfile = async (req, res) => {
     }
 
     if (skills !== undefined) profile.skills = skills;
+    if (tier !== undefined) profile.tier = tier;
     if (experience !== undefined) profile.experience = experience;
     if (city !== undefined) profile.city = city;
     if (state !== undefined) profile.state = state;

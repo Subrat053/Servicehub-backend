@@ -310,6 +310,23 @@ const uploadProfilePhoto = async (req, res) => {
   res.json({ url });
 };
 
+const getProfilePhoto = async (req, res) => {
+  const admin = await User.findById(req.user._id);
+  if (!admin) {
+    return res.status(404).json({ message: 'Admin not found' });
+  }
+  if (!admin.profilePhoto) {
+    return res.status(404).json({ message: 'Profile photo not found' });
+  }
+  res.json({ url: admin.profilePhoto });
+  res.json({
+    _id: admin._id,
+    name: admin.name,
+    email: admin.email,
+    profilePhoto: admin.profilePhoto
+  });
+};
+
 // @desc    Get payment gateway settings
 // @route   GET /api/admin/payment-settings
 const getPaymentSettings = async (req, res) => {

@@ -3,6 +3,7 @@ const mongoose = require('mongoose');
 const providerProfileSchema = new mongoose.Schema({
   user: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true, unique: true },
   skills: [{ type: String, trim: true }],
+  tier: { type: String, enum: ['unskilled', 'semi-skilled', 'skilled'], default: 'unskilled' },
   experience: { type: String, default: '' },
   city: { type: String, required: true, trim: true },
   state: { type: String, default: '', trim: true },
@@ -43,6 +44,7 @@ const providerProfileSchema = new mongoose.Schema({
 
 providerProfileSchema.index({ skills: 1, city: 1 });
 providerProfileSchema.index({ city: 1 });
+providerProfileSchema.index({ tier: 1 });
 providerProfileSchema.index({ boostWeight: -1 });
 
 module.exports = mongoose.model('ProviderProfile', providerProfileSchema);
