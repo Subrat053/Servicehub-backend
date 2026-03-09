@@ -3,6 +3,7 @@ const router = express.Router();
 const {
   getDashboard,
   getUsers,
+  getUserDetail,
   toggleBlockUser,
   approveProvider,
   getProviders,
@@ -22,26 +23,36 @@ const {
   deleteProvider,
   getPaymentSettings,
   updatePaymentSettings,
+  getCurrencySettings,
+  updateCurrencySettings,
+  getCloudinarySettings,
+  updateCloudinarySettings,
+  getWhatsappLogs,
+  getWhatsappSettings,
+  updateWhatsappSettings,
   getSkillCategories,
   createSkillCategory,
   updateSkillCategory,
   addSkillToCategory,
   removeSkillFromCategory,
   deleteSkillCategory,
+  uploadProfilePhoto,
+  getProfilePhoto,
 } = require('../controllers/adminController');
 const upload = require('../middleware/upload');
 
-// Admin content management
-router.get('/content/:type', getContent); // type: terms, privacy, faq
-router.put('/content/:type', updateContent);
+// Admin content management (public for terms/privacy/faq display)
+router.get('/content/:type', getContent);
+router.put('/content/:type', require('../middleware/auth').protect, require('../middleware/auth').authorize('admin'), updateContent);
 
 const { protect, authorize } = require('../middleware/auth');
 
-// All admin routes require admin role
+// All admin routes below require admin role
 router.use(protect, authorize('admin'));
 
 router.get('/dashboard', getDashboard);
 router.get('/users', getUsers);
+router.get('/users/:id', getUserDetail);
 router.put('/users/:id/block', toggleBlockUser);
 router.delete('/users/:id', deleteUser);
 router.put('/providers/:id/approve', approveProvider);
@@ -58,8 +69,16 @@ router.put('/rotation-pools/:id', updateRotationPool);
 router.get('/payments', getPayments);
 router.get('/payment-settings', getPaymentSettings);
 router.put('/payment-settings', updatePaymentSettings);
+router.get('/currency-settings', getCurrencySettings);
+router.put('/currency-settings', updateCurrencySettings);
+router.get('/cloudinary-settings', getCloudinarySettings);
+router.put('/cloudinary-settings', updateCloudinarySettings);
+router.get('/whatsapp-logs', getWhatsappLogs);
+router.get('/whatsapp-settings', getWhatsappSettings);
+router.put('/whatsapp-settings', updateWhatsappSettings);
 router.get('/jobs', getAllJobs);
-router.post('/profile/photo', protect, authorize('admin'), upload.single('profilePhoto'), require('../controllers/adminController').uploadProfilePhoto);
+router.post('/profile/photo', upload.single('profilePhoto'), uploadProfilePhoto);
+router.get('/profile/photo', getProfilePhoto);
 
 // Skill category management (admin)
 router.get('/skills', getSkillCategories);

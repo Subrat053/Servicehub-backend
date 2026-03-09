@@ -9,6 +9,9 @@ const {
   sendEmailVerification,
   confirmEmailVerification,
   getMe,
+  updateWhatsappNumber,
+  updateLocale,
+  toggleWhatsappAlerts,
 } = require('../controllers/authController');
 const { protect } = require('../middleware/auth');
 
@@ -20,5 +23,8 @@ router.post('/whatsapp/verify-otp', whatsappVerifyOtp);
 router.post('/verify-email/send', protect, sendEmailVerification);
 router.post('/verify-email/confirm', protect, confirmEmailVerification);
 router.get('/me', protect, getMe);
+router.put('/whatsapp-number', protect, updateWhatsappNumber);
+router.put('/locale', protect, updateLocale);
+router.put('/whatsapp-alerts', protect, toggleWhatsappAlerts);
 
 module.exports = router;

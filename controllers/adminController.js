@@ -10,7 +10,10 @@ const AdminSetting = require('../models/AdminSetting');
 const RotationPool = require('../models/RotationPool');
 const WhatsappLog = require('../models/WhatsappLog');
 const Review = require('../models/Review');
+const VisitHistory = require('../models/VisitHistory');
+const { uploadToCloudinary, deleteFromCloudinary } = require('../utils/cloudinary');
 const path = require('path');
+const fs = require('fs');
 
 // @desc    Admin dashboard stats
 // @route   GET /api/admin/dashboard
@@ -300,30 +303,40 @@ const getAllJobs = async (req, res) => {
   }
 };
 
-// @desc    Upload admin profile photo
+// @desc    Upload admin profile photo (Cloudinary)
 // @route   POST /api/admin/profile/photo
 const uploadProfilePhoto = async (req, res) => {
   if (!req.file) return res.status(400).json({ message: 'No file uploaded' });
-  const url = `/uploads/${req.file.filename}`;
-  // Save to User model (admin)
-  await User.findByIdAndUpdate(req.user._id, { profilePhoto: url });
-  res.json({ url });
+  try {
+    let url;
+    try {
+      const result = await uploadToCloudinary(req.file.buffer, {
+        folder: 'servicehub/admin',
+        public_id: `admin_${req.user._id}_${Date.now()}`,
+      });
+      url = result.secure_url;
+    } catch (cloudErr) {
+      const ext = path.extname(req.file.originalname);
+      const filename = `${Date.now()}-${Math.round(Math.random()*1e9)}${ext}`;
+      const filepath = path.join(__dirname, '../uploads/', filename);
+      fs.writeFileSync(filepath, req.file.buffer);
+      url = `/uploads/${filename}`;
+    }
+    await User.findByIdAndUpdate(req.user._id, { profilePhoto: url, avatar: url });
+    res.json({ url });
+  } catch (error) {
+    res.status(500).json({ message: 'Server error', error: error.message });
+  }
 };
 
 const getProfilePhoto = async (req, res) => {
   const admin = await User.findById(req.user._id);
-  if (!admin) {
-    return res.status(404).json({ message: 'Admin not found' });
-  }
-  if (!admin.profilePhoto) {
-    return res.status(404).json({ message: 'Profile photo not found' });
-  }
-  res.json({ url: admin.profilePhoto });
+  if (!admin) return res.status(404).json({ message: 'Admin not found' });
   res.json({
     _id: admin._id,
     name: admin.name,
     email: admin.email,
-    profilePhoto: admin.profilePhoto
+    profilePhoto: admin.profilePhoto || '',
   });
 };
 
@@ -520,9 +533,208 @@ const deleteSkillCategory = async (req, res) => {
   }
 };
 
+// ─── User Detail View (admin sees everything) ──────────────────────────────────
+
+// @desc    Get detailed user profile (admin can see any user)
+// @route   GET /api/admin/users/:id
+const getUserDetail = async (req, res) => {
+  try {
+    const user = await User.findById(req.params.id).select('-password');
+    if (!user) return res.status(404).json({ message: 'User not found' });
+
+    let profile = null;
+    let leads = [];
+    let history = [];
+    let payments = [];
+
+    if (user.role === 'provider') {
+      profile = await ProviderProfile.findOne({ user: user._id });
+      leads = await Lead.find({ provider: user._id }).sort({ createdAt: -1 }).limit(20).populate('recruiter', 'name email');
+    } else if (user.role === 'recruiter') {
+      profile = await RecruiterProfile.findOne({ user: user._id });
+      leads = await Lead.find({ recruiter: user._id }).sort({ createdAt: -1 }).limit(20).populate('provider', 'name email');
+    }
+
+    history = await VisitHistory.find({ user: user._id }).sort({ createdAt: -1 }).limit(30);
+    payments = await Payment.find({ user: user._id }).sort({ createdAt: -1 }).limit(20).populate('plan', 'name price');
+
+    res.json({ user, profile, leads, history, payments });
+  } catch (error) {
+    res.status(500).json({ message: 'Server error', error: error.message });
+  }
+};
+
+// ─── Currency Settings ─────────────────────────────────────────────────────────
+
+// @desc    Get currency configuration
+// @route   GET /api/admin/currency-settings
+const getCurrencySettings = async (req, res) => {
+  try {
+    const settings = await AdminSetting.find({ category: 'currency' });
+    const config = {};
+    settings.forEach(s => { config[s.key] = s.value; });
+    res.json({
+      default_currency_IN: config.default_currency_IN || 'INR',
+      default_currency_AE: config.default_currency_AE || 'AED',
+      exchange_rate_INR_AED: config.exchange_rate_INR_AED || 0.044,
+      exchange_rate_INR_USD: config.exchange_rate_INR_USD || 0.012,
+    });
+  } catch (error) {
+    res.status(500).json({ message: 'Server error', error: error.message });
+  }
+};
+
+// @desc    Update currency configuration
+// @route   PUT /api/admin/currency-settings
+const updateCurrencySettings = async (req, res) => {
+  try {
+    const { default_currency_IN, default_currency_AE, exchange_rate_INR_AED, exchange_rate_INR_USD } = req.body;
+    const updates = [
+      { key: 'default_currency_IN', value: default_currency_IN || 'INR', description: 'Default currency for India' },
+      { key: 'default_currency_AE', value: default_currency_AE || 'AED', description: 'Default currency for UAE' },
+      { key: 'exchange_rate_INR_AED', value: parseFloat(exchange_rate_INR_AED) || 0.044, description: 'INR to AED exchange rate' },
+      { key: 'exchange_rate_INR_USD', value: parseFloat(exchange_rate_INR_USD) || 0.012, description: 'INR to USD exchange rate' },
+    ];
+    for (const item of updates) {
+      await AdminSetting.findOneAndUpdate(
+        { key: item.key },
+        { value: item.value, description: item.description, category: 'currency' },
+        { upsert: true, new: true }
+      );
+    }
+    res.json({ message: 'Currency settings updated' });
+  } catch (error) {
+    res.status(500).json({ message: 'Server error', error: error.message });
+  }
+};
+
+// ─── Cloudinary Settings ────────────────────────────────────────────────────────
+
+// @desc    Get Cloudinary configuration
+// @route   GET /api/admin/cloudinary-settings
+const getCloudinarySettings = async (req, res) => {
+  try {
+    const settings = await AdminSetting.find({ category: 'cloudinary' });
+    const config = {};
+    settings.forEach(s => {
+      if (s.key === 'cloudinary_api_secret') {
+        config[s.key] = s.value ? '••••••••' + String(s.value).slice(-4) : '';
+      } else {
+        config[s.key] = s.value;
+      }
+    });
+    res.json({
+      cloudinary_cloud_name: config.cloudinary_cloud_name || '',
+      cloudinary_api_key: config.cloudinary_api_key || '',
+      cloudinary_api_secret: config.cloudinary_api_secret || '',
+    });
+  } catch (error) {
+    res.status(500).json({ message: 'Server error', error: error.message });
+  }
+};
+
+// @desc    Update Cloudinary configuration
+// @route   PUT /api/admin/cloudinary-settings
+const updateCloudinarySettings = async (req, res) => {
+  try {
+    const { cloudinary_cloud_name, cloudinary_api_key, cloudinary_api_secret } = req.body;
+    const updates = [
+      { key: 'cloudinary_cloud_name', value: cloudinary_cloud_name, description: 'Cloudinary Cloud Name' },
+      { key: 'cloudinary_api_key', value: cloudinary_api_key, description: 'Cloudinary API Key' },
+    ];
+    if (cloudinary_api_secret && !cloudinary_api_secret.startsWith('••')) {
+      updates.push({ key: 'cloudinary_api_secret', value: cloudinary_api_secret, description: 'Cloudinary API Secret' });
+    }
+    for (const item of updates) {
+      await AdminSetting.findOneAndUpdate(
+        { key: item.key },
+        { value: item.value, description: item.description, category: 'cloudinary' },
+        { upsert: true, new: true }
+      );
+    }
+    res.json({ message: 'Cloudinary settings updated' });
+  } catch (error) {
+    res.status(500).json({ message: 'Server error', error: error.message });
+  }
+};
+
+// ─── WhatsApp Logs ──────────────────────────────────────────────────────────────
+
+// @desc    Get WhatsApp logs
+// @route   GET /api/admin/whatsapp-logs
+const getWhatsappLogs = async (req, res) => {
+  try {
+    const { page = 1, limit = 30 } = req.query;
+    const logs = await WhatsappLog.find()
+      .populate('user', 'name email phone')
+      .sort({ createdAt: -1 })
+      .skip((parseInt(page) - 1) * parseInt(limit))
+      .limit(parseInt(limit));
+    const total = await WhatsappLog.countDocuments();
+    res.json({ logs, pagination: { page: parseInt(page), limit: parseInt(limit), total, pages: Math.ceil(total / parseInt(limit)) } });
+  } catch (error) {
+    res.status(500).json({ message: 'Server error', error: error.message });
+  }
+};
+
+// ─── WhatsApp Settings ─────────────────────────────────────────────────────────
+
+// @desc    Get WhatsApp configuration
+// @route   GET /api/admin/whatsapp-settings
+const getWhatsappSettings = async (req, res) => {
+  try {
+    const settings = await AdminSetting.find({ category: 'whatsapp' });
+    const config = {};
+    settings.forEach(s => {
+      if (s.key === 'whatsapp_access_token') {
+        config[s.key] = s.value ? '••••••••' + String(s.value).slice(-4) : '';
+      } else {
+        config[s.key] = s.value;
+      }
+    });
+    res.json({
+      whatsapp_phone_number_id: config.whatsapp_phone_number_id || '',
+      whatsapp_access_token: config.whatsapp_access_token || '',
+      whatsapp_dev_mode: config.whatsapp_dev_mode || false,
+      whatsapp_otp_template: config.whatsapp_otp_template || '',
+      whatsapp_welcome_template: config.whatsapp_welcome_template || '',
+    });
+  } catch (error) {
+    res.status(500).json({ message: 'Server error', error: error.message });
+  }
+};
+
+// @desc    Update WhatsApp configuration
+// @route   PUT /api/admin/whatsapp-settings
+const updateWhatsappSettings = async (req, res) => {
+  try {
+    const { whatsapp_phone_number_id, whatsapp_access_token, whatsapp_dev_mode, whatsapp_otp_template, whatsapp_welcome_template } = req.body;
+    const updates = [
+      { key: 'whatsapp_phone_number_id', value: whatsapp_phone_number_id, description: 'WhatsApp Phone Number ID' },
+      { key: 'whatsapp_dev_mode', value: whatsapp_dev_mode === true || whatsapp_dev_mode === 'true', description: 'WhatsApp dev mode' },
+      { key: 'whatsapp_otp_template', value: whatsapp_otp_template || '', description: 'WhatsApp OTP template name' },
+      { key: 'whatsapp_welcome_template', value: whatsapp_welcome_template || '', description: 'WhatsApp welcome template' },
+    ];
+    if (whatsapp_access_token && !whatsapp_access_token.startsWith('••')) {
+      updates.push({ key: 'whatsapp_access_token', value: whatsapp_access_token, description: 'WhatsApp Access Token' });
+    }
+    for (const item of updates) {
+      await AdminSetting.findOneAndUpdate(
+        { key: item.key },
+        { value: item.value, description: item.description, category: 'whatsapp' },
+        { upsert: true, new: true }
+      );
+    }
+    res.json({ message: 'WhatsApp settings updated' });
+  } catch (error) {
+    res.status(500).json({ message: 'Server error', error: error.message });
+  }
+};
+
 module.exports = {
   getDashboard,
   getUsers,
+  getUserDetail,
   toggleBlockUser,
   approveProvider,
   getProviders,
@@ -539,10 +751,18 @@ module.exports = {
   getContent,
   updateContent,
   uploadProfilePhoto,
+  getProfilePhoto,
   deleteUser,
   deleteProvider,
   getPaymentSettings,
   updatePaymentSettings,
+  getCurrencySettings,
+  updateCurrencySettings,
+  getCloudinarySettings,
+  updateCloudinarySettings,
+  getWhatsappLogs,
+  getWhatsappSettings,
+  updateWhatsappSettings,
   getSkillCategories,
   createSkillCategory,
   updateSkillCategory,

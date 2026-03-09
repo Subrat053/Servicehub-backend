@@ -5,14 +5,26 @@ const RotationPool = require('../models/RotationPool');
 const Payment = require('../models/Payment');
 const Plan = require('../models/Plan');
 const Review = require('../models/Review');
+const VisitHistory = require('../models/VisitHistory');
+const WhatsappLog = require('../models/WhatsappLog');
+const { uploadToCloudinary, deleteFromCloudinary } = require('../utils/cloudinary');
+const { sendWhatsAppMessage } = require('../utils/messaging');
 const path = require('path');
+const fs = require('fs');
 
 // @desc    Get provider profile (own)
 // @route   GET /api/provider/profile
 const getMyProfile = async (req, res) => {
   try {
-    const profile = await ProviderProfile.findOne({ user: req.user._id }).populate('user', 'name email phone avatar');
-    if (!profile) return res.status(404).json({ message: 'Profile not found' });
+    let profile = await ProviderProfile.findOne({ user: req.user._id }).populate('user', 'name email phone avatar profilePhoto');
+    if (!profile) {
+      // Auto-create if missing (data-recovery for legacy accounts)
+      profile = await ProviderProfile.create({
+        user: req.user._id,
+        profileExpiresAt: new Date(Date.now() + 365 * 24 * 60 * 60 * 1000),
+      });
+      profile = await ProviderProfile.findOne({ user: req.user._id }).populate('user', 'name email phone avatar profilePhoto');
+    }
     res.json(profile);
   } catch (error) {
     res.status(500).json({ message: 'Server error', error: error.message });
@@ -30,9 +42,12 @@ const updateProfile = async (req, res) => {
     } = req.body;
 
     let profile = await ProviderProfile.findOne({ user: req.user._id });
-    if (!profile) return res.status(404).json({ message: 'Profile not found' });
-
-    // Free skill limit check
+    if (!profile) {
+      profile = await ProviderProfile.create({
+        user: req.user._id,
+        profileExpiresAt: new Date(Date.now() + 365 * 24 * 60 * 60 * 1000),
+      });
+    }
     const FREE_LIMIT = parseInt(process.env.FREE_SKILLS_LIMIT || 4);
     if (skills && skills.length > FREE_LIMIT && profile.currentPlan === 'free') {
       return res.status(403).json({
@@ -114,8 +129,13 @@ async function updateRotationPool(skill, city, profileId) {
 // @route   GET /api/provider/dashboard
 const getDashboard = async (req, res) => {
   try {
-    const profile = await ProviderProfile.findOne({ user: req.user._id });
-    if (!profile) return res.status(404).json({ message: 'Profile not found' });
+    let profile = await ProviderProfile.findOne({ user: req.user._id });
+    if (!profile) {
+      profile = await ProviderProfile.create({
+        user: req.user._id,
+        profileExpiresAt: new Date(Date.now() + 365 * 24 * 60 * 60 * 1000),
+      });
+    }
 
     const leads = await Lead.find({ provider: req.user._id })
       .sort({ createdAt: -1 })
@@ -247,20 +267,119 @@ const getPublicProfile = async (req, res) => {
   }
 };
 
-// @desc    Upload provider profile photo
+// @desc    Upload provider profile photo (Cloudinary)
 // @route   POST /api/provider/profile/photo
 const uploadProfilePhoto = async (req, res) => {
-  if (!req.file) return res.status(400).json({ message: 'No file uploaded' });
-  const url = `/uploads/${req.file.filename}`;
-  // Save to ProviderProfile
-  const profile = await ProviderProfile.findOneAndUpdate(
-    { user: req.user._id },
-    { profilePhoto: url },
-    { new: true }
-  );
-  // Also update User model
-  await User.findByIdAndUpdate(req.user._id, { profilePhoto: url });
-  res.json({ url });
+  try {
+    if (!req.file) return res.status(400).json({ message: 'No file uploaded' });
+
+    let newUrl;
+    try {
+      // Try Cloudinary upload
+      const result = await uploadToCloudinary(req.file.buffer, {
+        folder: 'servicehub/providers',
+        public_id: `provider_${req.user._id}_${Date.now()}`,
+      });
+      newUrl = result.secure_url;
+    } catch (cloudErr) {
+      // Fallback to disk storage
+      const ext = path.extname(req.file.originalname);
+      const filename = `${Date.now()}-${Math.round(Math.random()*1e9)}${ext}`;
+      const filepath = path.join(__dirname, '../uploads/', filename);
+      fs.writeFileSync(filepath, req.file.buffer);
+      newUrl = `/uploads/${filename}`;
+    }
+
+    // Delete old Cloudinary file
+    const profile = await ProviderProfile.findOne({ user: req.user._id });
+    const oldFile = profile?.profilePhoto || profile?.photo;
+    if (oldFile && oldFile.includes('cloudinary.com')) {
+      await deleteFromCloudinary(oldFile);
+    } else if (oldFile && oldFile.startsWith('/uploads/')) {
+      const oldPath = path.join(__dirname, '..', oldFile);
+      if (fs.existsSync(oldPath)) fs.unlinkSync(oldPath);
+    }
+
+    await ProviderProfile.findOneAndUpdate(
+      { user: req.user._id },
+      { profilePhoto: newUrl, photo: newUrl },
+      { new: true }
+    );
+    await User.findByIdAndUpdate(req.user._id, { profilePhoto: newUrl, avatar: newUrl });
+
+    res.json({ url: newUrl });
+  } catch (error) {
+    res.status(500).json({ message: 'Server error', error: error.message });
+  }
+};
+
+// @desc    Delete provider profile photo
+// @route   DELETE /api/provider/profile/photo
+const deleteProfilePhoto = async (req, res) => {
+  try {
+    const profile = await ProviderProfile.findOne({ user: req.user._id });
+    const oldFile = profile?.profilePhoto || profile?.photo;
+    if (oldFile && oldFile.includes('cloudinary.com')) {
+      await deleteFromCloudinary(oldFile);
+    } else if (oldFile && oldFile.startsWith('/uploads/')) {
+      const oldPath = path.join(__dirname, '..', oldFile);
+      if (fs.existsSync(oldPath)) fs.unlinkSync(oldPath);
+    }
+
+    await ProviderProfile.findOneAndUpdate({ user: req.user._id }, { profilePhoto: '', photo: '' });
+    await User.findByIdAndUpdate(req.user._id, { profilePhoto: '', avatar: '' });
+
+    res.json({ message: 'Photo deleted' });
+  } catch (error) {
+    res.status(500).json({ message: 'Server error', error: error.message });
+  }
+};
+
+// @desc    Upload document to Cloudinary
+// @route   POST /api/provider/profile/document
+const uploadDocument = async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ message: 'No file uploaded' });
+
+    let url;
+    try {
+      const result = await uploadToCloudinary(req.file.buffer, {
+        folder: 'servicehub/documents',
+        resource_type: 'auto',
+        public_id: `doc_${req.user._id}_${Date.now()}`,
+      });
+      url = result.secure_url;
+    } catch (cloudErr) {
+      const ext = path.extname(req.file.originalname);
+      const filename = `${Date.now()}-${Math.round(Math.random()*1e9)}${ext}`;
+      const filepath = path.join(__dirname, '../uploads/', filename);
+      fs.writeFileSync(filepath, req.file.buffer);
+      url = `/uploads/${filename}`;
+    }
+
+    const profile = await ProviderProfile.findOne({ user: req.user._id });
+    if (!profile) return res.status(404).json({ message: 'Profile not found' });
+    profile.documents.push(url);
+    await profile.save();
+
+    res.json({ url, documents: profile.documents });
+  } catch (error) {
+    res.status(500).json({ message: 'Server error', error: error.message });
+  }
+};
+
+// @desc    Get provider visit history
+// @route   GET /api/provider/history
+const getMyHistory = async (req, res) => {
+  try {
+    const history = await VisitHistory.find({ visitedUser: req.user._id })
+      .sort({ createdAt: -1 })
+      .limit(50)
+      .populate('user', 'name email avatar');
+    res.json(history);
+  } catch (error) {
+    res.status(500).json({ message: 'Server error', error: error.message });
+  }
 };
 
 module.exports = {
@@ -273,4 +392,7 @@ module.exports = {
   updateLeadStatus,
   getPublicProfile,
   uploadProfilePhoto,
+  deleteProfilePhoto,
+  uploadDocument,
+  getMyHistory,
 };

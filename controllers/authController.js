@@ -5,6 +5,20 @@ const Otp = require('../models/Otp');
 const generateToken = require('../utils/generateToken');
 const { generateOTP, sendPhoneOTP, sendEmailOTP, sendWhatsAppMessage } = require('../utils/messaging');
 
+// Helper: detect country from IP (simple heuristic)
+function detectCountryFromIP(ip) {
+  // Default to India; actual GeoIP can be added later
+  return 'IN';
+}
+function getDefaultCurrency(country) {
+  return country === 'AE' ? 'AED' : 'INR';
+}
+function getDefaultLocale(country) {
+  if (country === 'AE') return 'en'; // UAE uses English primarily
+  return 'en';
+}
+const VALIDITY_DAYS = parseInt(process.env.PROFILE_VALIDITY_DAYS || 365);
+
 // @desc    Register user with email
 // @route   POST /api/auth/register
 const registerEmail = async (req, res) => {
@@ -26,6 +40,7 @@ const registerEmail = async (req, res) => {
       });
     }
 
+    const country = detectCountryFromIP(req.ip);
     const user = await User.create({
       name,
       email,
@@ -35,6 +50,10 @@ const registerEmail = async (req, res) => {
       authProvider: 'email',
       termsAccepted: true,
       ipAddress: req.ip,
+      country,
+      currency: getDefaultCurrency(country),
+      locale: getDefaultLocale(country),
+      accountExpiresAt: new Date(Date.now() + VALIDITY_DAYS * 24 * 60 * 60 * 1000),
     });
 
     // Create role-specific profile
@@ -42,12 +61,13 @@ const registerEmail = async (req, res) => {
       await ProviderProfile.create({
         user: user._id,
         city: '',
-        profileExpiresAt: new Date(Date.now() + parseInt(process.env.PROFILE_VALIDITY_DAYS || 365) * 24 * 60 * 60 * 1000),
+        profileExpiresAt: new Date(Date.now() + VALIDITY_DAYS * 24 * 60 * 60 * 1000),
       });
     } else {
       await RecruiterProfile.create({
         user: user._id,
         freeViewResetAt: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),
+        profileExpiresAt: new Date(Date.now() + VALIDITY_DAYS * 24 * 60 * 60 * 1000),
       });
     }
 
@@ -59,6 +79,7 @@ const registerEmail = async (req, res) => {
       email: user.email,
       role: user.role,
       token,
+      isNewUser: true,
     });
   } catch (error) {
     console.error(error);
@@ -109,14 +130,35 @@ const loginUser = async (req, res) => {
 // @route   POST /api/auth/google
 const googleAuth = async (req, res) => {
   try {
-    const { name, email, googleId, avatar, role } = req.body;
+    const { accessToken, role } = req.body;
+
+    if (!accessToken) {
+      return res.status(400).json({ message: 'Google access token required' });
+    }
+
+    // Verify the access token by calling Google's userinfo endpoint
+    const googleRes = await fetch(
+      `https://www.googleapis.com/oauth2/v3/userinfo?access_token=${encodeURIComponent(accessToken)}`
+    );
+
+    if (!googleRes.ok) {
+      return res.status(401).json({ message: 'Invalid or expired Google token' });
+    }
+
+    const googleUser = await googleRes.json();
+    const { sub: googleId, name, email, picture: avatar, email_verified } = googleUser;
 
     if (!email || !googleId) {
-      return res.status(400).json({ message: 'Google auth data required' });
+      return res.status(400).json({ message: 'Could not retrieve Google account info' });
+    }
+
+    if (!email_verified) {
+      return res.status(400).json({ message: 'Google account email is not verified' });
     }
 
     let user = await User.findOne({ email });
 
+    let isNewUser = false;
     if (user) {
       // Existing user - login with their existing role
       if (user.isBlocked) {
@@ -124,19 +166,37 @@ const googleAuth = async (req, res) => {
       }
       // If user provides a different role than registered, inform them
       if (role && role !== user.role) {
-        return res.status(400).json({ 
+        return res.status(400).json({
           message: `This email is already registered as a ${user.role}. Logging you in with your existing role.`,
-          existingRole: user.role
+          existingRole: user.role,
         });
       }
       user.lastLogin = new Date();
       user.googleId = googleId;
       if (avatar) user.avatar = avatar;
       await user.save();
+
+      // Auto-create profile if it somehow doesn't exist
+      if (user.role === 'provider') {
+        const exists = await ProviderProfile.findOne({ user: user._id });
+        if (!exists) {
+          await ProviderProfile.create({ user: user._id, profileExpiresAt: new Date(Date.now() + 365 * 24 * 60 * 60 * 1000) });
+          isNewUser = true;
+        }
+      } else if (user.role === 'recruiter') {
+        const exists = await RecruiterProfile.findOne({ user: user._id });
+        if (!exists) {
+          await RecruiterProfile.create({ user: user._id, freeViewResetAt: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000) });
+          isNewUser = true;
+        }
+      }
     } else {
       // New user - signup
       if (!role) {
         return res.status(400).json({ message: 'Role is required for new signup' });
+      }
+      if (!['provider', 'recruiter'].includes(role)) {
+        return res.status(400).json({ message: 'Invalid role' });
       }
       user = await User.create({
         name,
@@ -153,7 +213,6 @@ const googleAuth = async (req, res) => {
       if (role === 'provider') {
         await ProviderProfile.create({
           user: user._id,
-          city: '',
           profileExpiresAt: new Date(Date.now() + 365 * 24 * 60 * 60 * 1000),
         });
       } else if (role === 'recruiter') {
@@ -162,6 +221,7 @@ const googleAuth = async (req, res) => {
           freeViewResetAt: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),
         });
       }
+      isNewUser = true;
     }
 
     const token = generateToken(user._id, user.role);
@@ -173,6 +233,7 @@ const googleAuth = async (req, res) => {
       role: user.role,
       avatar: user.avatar,
       token,
+      isNewUser,
     });
   } catch (error) {
     res.status(500).json({ message: 'Server error', error: error.message });
@@ -223,12 +284,28 @@ const whatsappVerifyOtp = async (req, res) => {
     await otpRecord.save();
 
     let user = await User.findOne({ phone });
+    let isNewUser = false;
 
     if (user) {
       // Existing user
       user.isPhoneVerified = true;
       user.lastLogin = new Date();
       await user.save();
+
+      // Auto-create profile if missing
+      if (user.role === 'provider') {
+        const exists = await ProviderProfile.findOne({ user: user._id });
+        if (!exists) {
+          await ProviderProfile.create({ user: user._id, profileExpiresAt: new Date(Date.now() + 365 * 24 * 60 * 60 * 1000) });
+          isNewUser = true;
+        }
+      } else if (user.role === 'recruiter') {
+        const exists = await RecruiterProfile.findOne({ user: user._id });
+        if (!exists) {
+          await RecruiterProfile.create({ user: user._id, freeViewResetAt: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000) });
+          isNewUser = true;
+        }
+      }
     } else {
       // New user
       if (!name || !role) {
@@ -249,7 +326,6 @@ const whatsappVerifyOtp = async (req, res) => {
       if (role === 'provider') {
         await ProviderProfile.create({
           user: user._id,
-          city: '',
           profileExpiresAt: new Date(Date.now() + 365 * 24 * 60 * 60 * 1000),
         });
       } else if (role === 'recruiter') {
@@ -258,7 +334,7 @@ const whatsappVerifyOtp = async (req, res) => {
           freeViewResetAt: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),
         });
       }
-
+      isNewUser = true;
       await sendWhatsAppMessage(phone, 'welcome', { name: user.name });
     }
 
@@ -271,6 +347,7 @@ const whatsappVerifyOtp = async (req, res) => {
       phone: user.phone,
       role: user.role,
       token,
+      isNewUser,
     });
   } catch (error) {
     res.status(500).json({ message: 'Server error', error: error.message });
@@ -341,6 +418,64 @@ const getMe = async (req, res) => {
   }
 };
 
+// @desc    Update WhatsApp number (for email/google signup users)
+// @route   PUT /api/auth/whatsapp-number
+const updateWhatsappNumber = async (req, res) => {
+  try {
+    const { whatsappNumber } = req.body;
+    if (!whatsappNumber) return res.status(400).json({ message: 'WhatsApp number is required' });
+
+    const user = await User.findById(req.user._id);
+    user.whatsappNumber = whatsappNumber;
+    user.whatsappConsent = true;
+    await user.save();
+
+    res.json({ message: 'WhatsApp number updated', whatsappNumber: user.whatsappNumber });
+  } catch (error) {
+    res.status(500).json({ message: 'Server error', error: error.message });
+  }
+};
+
+// @desc    Update user locale/country preference
+// @route   PUT /api/auth/locale
+const updateLocale = async (req, res) => {
+  try {
+    const { locale, country, currency } = req.body;
+    const user = await User.findById(req.user._id);
+
+    if (locale && ['en', 'hi', 'ar'].includes(locale)) user.locale = locale;
+    if (country && ['IN', 'AE'].includes(country)) user.country = country;
+    if (currency && ['INR', 'AED', 'USD'].includes(currency)) user.currency = currency;
+    await user.save();
+
+    res.json({ locale: user.locale, country: user.country, currency: user.currency });
+  } catch (error) {
+    res.status(500).json({ message: 'Server error', error: error.message });
+  }
+};
+
+// @desc    Toggle WhatsApp alerts
+// @route   PUT /api/auth/whatsapp-alerts
+const toggleWhatsappAlerts = async (req, res) => {
+  try {
+    const { enabled } = req.body;
+    const user = await User.findById(req.user._id);
+    user.whatsappAlerts = enabled !== false;
+    await user.save();
+
+    // Also update profile-level alerts
+    if (user.role === 'provider') {
+      await ProviderProfile.findOneAndUpdate({ user: user._id }, { whatsappAlerts: user.whatsappAlerts });
+    } else if (user.role === 'recruiter') {
+      await RecruiterProfile.findOneAndUpdate({ user: user._id }, { whatsappAlerts: user.whatsappAlerts });
+    }
+
+    res.json({ whatsappAlerts: user.whatsappAlerts });
+  } catch (error) {
+    res.status(500).json({ message: 'Server error', error: error.message });
+  }
+};
+
 module.exports = {
   registerEmail,
   loginUser,
@@ -350,4 +485,7 @@ module.exports = {
   sendEmailVerification,
   confirmEmailVerification,
   getMe,
+  updateWhatsappNumber,
+  updateLocale,
+  toggleWhatsappAlerts,
 };

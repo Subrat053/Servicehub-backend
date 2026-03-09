@@ -7,15 +7,25 @@ const Plan = require('../models/Plan');
 const Review = require('../models/Review');
 const RotationPool = require('../models/RotationPool');
 const User = require('../models/User');
+const VisitHistory = require('../models/VisitHistory');
+const WhatsappLog = require('../models/WhatsappLog');
 const { sendWhatsAppMessage } = require('../utils/messaging');
+const { uploadToCloudinary, deleteFromCloudinary } = require('../utils/cloudinary');
 const path = require('path');
+const fs = require('fs');
 
 // @desc    Get recruiter dashboard
 // @route   GET /api/recruiter/dashboard
 const getDashboard = async (req, res) => {
   try {
-    const profile = await RecruiterProfile.findOne({ user: req.user._id });
-    if (!profile) return res.status(404).json({ message: 'Profile not found' });
+    let profile = await RecruiterProfile.findOne({ user: req.user._id });
+    if (!profile) {
+      // Auto-create if missing (data-recovery for legacy accounts)
+      profile = await RecruiterProfile.create({
+        user: req.user._id,
+        freeViewResetAt: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),
+      });
+    }
 
     const jobs = await JobPost.find({ recruiter: req.user._id }).sort({ createdAt: -1 }).limit(10);
     const recentUnlocks = await Lead.find({ recruiter: req.user._id, isUnlocked: true })
@@ -48,8 +58,13 @@ const getDashboard = async (req, res) => {
 const updateProfile = async (req, res) => {
   try {
     const { companyName, companyType, city, state, description, skillsNeeded } = req.body;
-    const profile = await RecruiterProfile.findOne({ user: req.user._id });
-    if (!profile) return res.status(404).json({ message: 'Profile not found' });
+    let profile = await RecruiterProfile.findOne({ user: req.user._id });
+    if (!profile) {
+      profile = await RecruiterProfile.create({
+        user: req.user._id,
+        freeViewResetAt: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),
+      });
+    }
 
     if (companyName !== undefined) profile.companyName = companyName;
     if (companyType !== undefined) profile.companyType = companyType;
@@ -84,30 +99,46 @@ const searchProviders = async (req, res) => {
     if (verified === 'true') filter.isVerified = true;
     filter.isApproved = true;
 
-    // Get rotation pool providers for top row
+    // Get rotation pool providers for top row (max 5, round-robin by last_shown)
     let rotationProviders = [];
-    if (skill && city) {
-      const pool = await RotationPool.findOne({
-        skill: skill.toLowerCase(),
-        city: city.toLowerCase(),
-      }).populate({
+    if (skill || city) {
+      const poolQuery = {};
+      if (skill) poolQuery.skill = skill.toLowerCase();
+      if (city) poolQuery.city = city.toLowerCase();
+
+      const pools = await RotationPool.find(poolQuery).populate({
         path: 'providers.provider',
         populate: { path: 'user', select: 'name avatar' },
       });
 
-      if (pool && pool.providers.length > 0) {
-        // Round-robin rotation
-        const sorted = [...pool.providers].sort((a, b) => new Date(a.lastShown) - new Date(b.lastShown));
-        const now = new Date();
-        rotationProviders = sorted.slice(0, pool.maxPoolSize)
-          .filter(p => p.provider)
-          .map(p => {
-            p.lastShown = now;
-            return p.provider;
-          });
+      // Merge providers from all matching pools, sort by lastShown (round-robin)
+      const allPoolProviders = [];
+      for (const pool of pools) {
+        for (const p of pool.providers) {
+          if (p.provider && p.provider.user) {
+            allPoolProviders.push({ ...p.toObject(), pool });
+          }
+        }
+      }
+      // Sort by lastShown ascending (least recently shown first)
+      allPoolProviders.sort((a, b) => new Date(a.lastShown) - new Date(b.lastShown));
 
-        pool.currentIndex = (pool.currentIndex + 1) % pool.providers.length;
-        await pool.save();
+      const now = new Date();
+      const topN = allPoolProviders.slice(0, 5);
+      rotationProviders = topN.map(p => p.provider).filter(Boolean);
+
+      // Update lastShown for these providers (round-robin)
+      for (const p of topN) {
+        if (p.pool) {
+          const pEntry = p.pool.providers.find(
+            pp => pp.provider && pp.provider._id.toString() === p.provider._id.toString()
+          );
+          if (pEntry) {
+            pEntry.lastShown = now;
+          }
+          p.pool.currentIndex = (p.pool.currentIndex + 1) % Math.max(p.pool.providers.length, 1);
+          await p.pool.save();
+        }
       }
     }
 
@@ -131,12 +162,23 @@ const searchProviders = async (req, res) => {
 
     const total = await ProviderProfile.countDocuments(filter);
 
-    // Track recruiter free view
+    // Track recruiter free view + save search history
     if (req.user && req.user.role === 'recruiter') {
       const recruiterProfile = await RecruiterProfile.findOne({ user: req.user._id });
       if (recruiterProfile) {
         recruiterProfile.freeProfileViews += 1;
         await recruiterProfile.save();
+      }
+
+      // Save search history
+      if (skill || city) {
+        await VisitHistory.create({
+          user: req.user._id,
+          type: 'search',
+          searchQuery: [skill, city].filter(Boolean).join(' in '),
+          searchCity: city || '',
+          searchSkill: skill || '',
+        });
       }
     }
 
@@ -168,7 +210,7 @@ const viewProvider = async (req, res) => {
 
     if (!isUnlimited && recruiterProfile.freeProfileViews >= FREE_LIMIT) {
       return res.status(403).json({
-        message: 'Free profile view limit reached. Purchase an unlock pack.',
+        message: 'Free profile view limit reached. Purchase a plan to continue.',
         limitReached: true,
         viewsUsed: recruiterProfile.freeProfileViews,
         limit: FREE_LIMIT,
@@ -176,8 +218,16 @@ const viewProvider = async (req, res) => {
     }
 
     const provider = await ProviderProfile.findById(req.params.id)
-      .populate('user', 'name avatar email');
+      .populate('user', 'name avatar email phone whatsappNumber');
     if (!provider) return res.status(404).json({ message: 'Provider not found' });
+
+    // Check if already unlocked
+    const existingUnlock = await Lead.findOne({
+      provider: provider.user._id,
+      recruiter: req.user._id,
+      type: 'contact_unlock',
+      isUnlocked: true,
+    });
 
     // Increment view count
     provider.profileViews += 1;
@@ -188,14 +238,40 @@ const viewProvider = async (req, res) => {
       await recruiterProfile.save();
     }
 
+    // Save visit history
+    await VisitHistory.create({
+      user: req.user._id,
+      visitedUser: provider.user._id,
+      visitedProfile: provider._id,
+      type: 'profile_view',
+    });
+
+    // Create a profile_view lead
+    await Lead.create({
+      provider: provider.user._id,
+      recruiter: req.user._id,
+      type: 'profile_view',
+    });
+    provider.leadsReceived += 1;
+    await provider.save();
+
     const reviews = await Review.find({ provider: provider.user._id })
       .sort({ createdAt: -1 })
       .limit(10)
       .populate('recruiter', 'name');
 
+    // Hide contact info if not unlocked
+    const contactInfo = existingUnlock ? {
+      phone: provider.user.phone,
+      email: provider.user.email,
+      whatsappNumber: provider.user.whatsappNumber || provider.user.phone,
+    } : null;
+
     res.json({
       provider,
       reviews,
+      isUnlocked: !!existingUnlock,
+      contactInfo,
       viewsRemaining: isUnlimited ? 'unlimited' : FREE_LIMIT - recruiterProfile.freeProfileViews,
     });
   } catch (error) {
@@ -203,33 +279,54 @@ const viewProvider = async (req, res) => {
   }
 };
 
-// @desc    Unlock provider contact
+// @desc    Unlock provider contact (requires plan/credits or payment)
 // @route   POST /api/recruiter/unlock/:providerId
 const unlockContact = async (req, res) => {
   try {
     const recruiterProfile = await RecruiterProfile.findOne({ user: req.user._id });
     if (!recruiterProfile) return res.status(404).json({ message: 'Profile not found' });
 
+    const providerProfile = await ProviderProfile.findById(req.params.providerId)
+      .populate('user', 'name email phone avatar whatsappNumber');
+    if (!providerProfile) return res.status(404).json({ message: 'Provider not found' });
+
+    // Check if already unlocked
+    const existing = await Lead.findOne({
+      provider: providerProfile.user._id,
+      recruiter: req.user._id,
+      type: 'contact_unlock',
+      isUnlocked: true,
+    });
+    if (existing) {
+      return res.json({
+        message: 'Contact already unlocked',
+        alreadyUnlocked: true,
+        contact: {
+          name: providerProfile.user.name,
+          email: providerProfile.user.email,
+          phone: providerProfile.user.phone,
+          whatsappNumber: providerProfile.user.whatsappNumber || providerProfile.user.phone,
+        },
+      });
+    }
+
     const isUnlimited = ['business', 'enterprise'].includes(recruiterProfile.currentPlan);
 
     if (!isUnlimited && recruiterProfile.unlocksRemaining <= 0) {
       return res.status(403).json({
-        message: 'No unlock credits remaining. Purchase an unlock pack.',
+        message: 'No unlock credits remaining. Purchase a plan to unlock contacts.',
         needsPurchase: true,
       });
     }
 
-    const providerProfile = await ProviderProfile.findById(req.params.providerId)
-      .populate('user', 'name email phone avatar');
-    if (!providerProfile) return res.status(404).json({ message: 'Provider not found' });
-
-    // Create payment record (simulated for unlock)
+    // Create payment record for unlock
     const payment = await Payment.create({
       user: req.user._id,
       amount: 0,
       type: 'unlock_pack',
       status: 'completed',
       transactionId: `UNL_${Date.now()}`,
+      metadata: { providerId: providerProfile._id.toString(), providerName: providerProfile.user.name },
     });
 
     // Create lead
@@ -252,11 +349,36 @@ const unlockContact = async (req, res) => {
     recruiterProfile.totalUnlocks += 1;
     await recruiterProfile.save();
 
+    // Save visit history
+    await VisitHistory.create({
+      user: req.user._id,
+      visitedUser: providerProfile.user._id,
+      visitedProfile: providerProfile._id,
+      type: 'contact_unlock',
+    });
+
     // WhatsApp notification to provider
-    if (providerProfile.whatsappAlerts && providerProfile.user.phone) {
-      await sendWhatsAppMessage(providerProfile.user.phone, 'new_lead', {
-        recruiterName: req.user.name,
-      });
+    const providerPhone = providerProfile.user.whatsappNumber || providerProfile.user.phone;
+    if (providerProfile.whatsappAlerts && providerPhone) {
+      try {
+        await sendWhatsAppMessage(providerPhone, 'new_lead', {
+          recruiterName: req.user.name,
+        });
+        // Log WhatsApp notification
+        await WhatsappLog.create({
+          user: providerProfile.user._id,
+          phone: providerPhone,
+          templateName: 'new_lead',
+          message: `New contact unlock from ${req.user.name}`,
+          status: 'sent',
+          triggerEvent: 'contact_unlock',
+          metadata: { recruiterId: req.user._id, leadId: lead._id },
+        });
+        lead.notifiedViaWhatsapp = true;
+        await lead.save();
+      } catch (whatsErr) {
+        console.error('[WhatsApp notify error]', whatsErr.message);
+      }
     }
 
     res.json({
@@ -265,6 +387,7 @@ const unlockContact = async (req, res) => {
         name: providerProfile.user.name,
         email: providerProfile.user.email,
         phone: providerProfile.user.phone,
+        whatsappNumber: providerProfile.user.whatsappNumber || providerProfile.user.phone,
       },
       lead,
     });
@@ -428,20 +551,102 @@ const addReview = async (req, res) => {
   }
 };
 
-// @desc    Upload recruiter profile photo
+// @desc    Upload recruiter profile photo (Cloudinary)
 // @route   POST /api/recruiter/profile/photo
 const uploadProfilePhoto = async (req, res) => {
-  if (!req.file) return res.status(400).json({ message: 'No file uploaded' });
-  const url = `/uploads/${req.file.filename}`;
-  // Save to RecruiterProfile
-  const profile = await RecruiterProfile.findOneAndUpdate(
-    { user: req.user._id },
-    { profilePhoto: url },
-    { new: true }
-  );
-  // Also update User model
-  await User.findByIdAndUpdate(req.user._id, { profilePhoto: url });
-  res.json({ url });
+  try {
+    if (!req.file) return res.status(400).json({ message: 'No file uploaded' });
+
+    let newUrl;
+    try {
+      const result = await uploadToCloudinary(req.file.buffer, {
+        folder: 'servicehub/recruiters',
+        public_id: `recruiter_${req.user._id}_${Date.now()}`,
+      });
+      newUrl = result.secure_url;
+    } catch (cloudErr) {
+      const ext = path.extname(req.file.originalname);
+      const filename = `${Date.now()}-${Math.round(Math.random()*1e9)}${ext}`;
+      const filepath = path.join(__dirname, '../uploads/', filename);
+      fs.writeFileSync(filepath, req.file.buffer);
+      newUrl = `/uploads/${filename}`;
+    }
+
+    const profile = await RecruiterProfile.findOne({ user: req.user._id });
+    if (profile?.profilePhoto && profile.profilePhoto.includes('cloudinary.com')) {
+      await deleteFromCloudinary(profile.profilePhoto);
+    } else if (profile?.profilePhoto && profile.profilePhoto.startsWith('/uploads/')) {
+      const oldPath = path.join(__dirname, '..', profile.profilePhoto);
+      if (fs.existsSync(oldPath)) fs.unlinkSync(oldPath);
+    }
+
+    await RecruiterProfile.findOneAndUpdate(
+      { user: req.user._id },
+      { profilePhoto: newUrl },
+      { new: true }
+    );
+    await User.findByIdAndUpdate(req.user._id, { profilePhoto: newUrl, avatar: newUrl });
+
+    res.json({ url: newUrl });
+  } catch (error) {
+    res.status(500).json({ message: 'Server error', error: error.message });
+  }
+};
+
+// @desc    Delete recruiter profile photo
+// @route   DELETE /api/recruiter/profile/photo
+const deleteProfilePhoto = async (req, res) => {
+  try {
+    const profile = await RecruiterProfile.findOne({ user: req.user._id });
+    if (profile?.profilePhoto && profile.profilePhoto.includes('cloudinary.com')) {
+      await deleteFromCloudinary(profile.profilePhoto);
+    } else if (profile?.profilePhoto && profile.profilePhoto.startsWith('/uploads/')) {
+      const oldPath = path.join(__dirname, '..', profile.profilePhoto);
+      if (fs.existsSync(oldPath)) fs.unlinkSync(oldPath);
+    }
+
+    await RecruiterProfile.findOneAndUpdate({ user: req.user._id }, { profilePhoto: '' });
+    await User.findByIdAndUpdate(req.user._id, { profilePhoto: '', avatar: '' });
+
+    res.json({ message: 'Photo deleted' });
+  } catch (error) {
+    res.status(500).json({ message: 'Server error', error: error.message });
+  }
+};
+
+// @desc    Get recruiter visit/search history
+// @route   GET /api/recruiter/history
+const getMyHistory = async (req, res) => {
+  try {
+    const history = await VisitHistory.find({ user: req.user._id })
+      .sort({ createdAt: -1 })
+      .limit(100)
+      .populate('visitedUser', 'name avatar')
+      .populate('visitedProfile', 'skills city rating profilePhoto');
+    res.json(history);
+  } catch (error) {
+    res.status(500).json({ message: 'Server error', error: error.message });
+  }
+};
+
+// @desc    Check if a provider contact is unlocked
+// @route   GET /api/recruiter/unlock-status/:providerId
+const checkUnlockStatus = async (req, res) => {
+  try {
+    const provider = await ProviderProfile.findById(req.params.providerId).populate('user', '_id');
+    if (!provider) return res.status(404).json({ message: 'Provider not found' });
+
+    const existing = await Lead.findOne({
+      provider: provider.user._id,
+      recruiter: req.user._id,
+      type: 'contact_unlock',
+      isUnlocked: true,
+    });
+
+    res.json({ isUnlocked: !!existing });
+  } catch (error) {
+    res.status(500).json({ message: 'Server error', error: error.message });
+  }
 };
 
 module.exports = {
@@ -456,4 +661,7 @@ module.exports = {
   purchasePlan,
   addReview,
   uploadProfilePhoto,
+  deleteProfilePhoto,
+  getMyHistory,
+  checkUnlockStatus,
 };

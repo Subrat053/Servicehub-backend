@@ -19,6 +19,15 @@ const recruiterProfileSchema = new mongoose.Schema({
   freeProfileViews: { type: Number, default: 0 },
   freeViewResetAt: { type: Date },
 
+  profilePhoto: { type: String, default: '' },
+
+  // WhatsApp
+  whatsappAlerts: { type: Boolean, default: true },
+
+  // Validity
+  profileExpiresAt: { type: Date },
+  renewalReminderSent: { type: Boolean, default: false },
+
   // Stats
   totalJobsPosted: { type: Number, default: 0 },
   totalUnlocks: { type: Number, default: 0 },

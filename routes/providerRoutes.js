@@ -9,6 +9,10 @@ const {
   getMyLeads,
   updateLeadStatus,
   getPublicProfile,
+  uploadProfilePhoto,
+  deleteProfilePhoto,
+  uploadDocument,
+  getMyHistory,
 } = require('../controllers/providerController');
 const { protect, authorize } = require('../middleware/auth');
 const upload = require('../middleware/upload');
@@ -20,7 +24,10 @@ router.get('/plans', protect, authorize('provider'), getPlans);
 router.post('/plans/purchase', protect, authorize('provider'), purchasePlan);
 router.get('/leads', protect, authorize('provider'), getMyLeads);
 router.put('/leads/:id', protect, authorize('provider'), updateLeadStatus);
+router.get('/history', protect, authorize('provider'), getMyHistory);
 router.get('/public/:id', getPublicProfile);
-router.post('/profile/photo', protect, authorize('provider'), upload.single('profilePhoto'), require('../controllers/providerController').uploadProfilePhoto);
+router.post('/profile/photo', protect, authorize('provider'), upload.single('profilePhoto'), uploadProfilePhoto);
+router.delete('/profile/photo', protect, authorize('provider'), deleteProfilePhoto);
+router.post('/profile/document', protect, authorize('provider'), upload.single('document'), uploadDocument);
 
 module.exports = router;

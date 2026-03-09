@@ -6,7 +6,9 @@ const planSchema = new mongoose.Schema({
   type: { type: String, enum: ['provider', 'recruiter'], required: true },
   price: { type: Number, required: true },
   currency: { type: String, default: 'INR' },
-  duration: { type: Number, default: 30 }, // in days
+  priceAED: { type: Number, default: 0 },
+  priceUSD: { type: Number, default: 0 },
+  duration: { type: Number, default: 365 }, // in days (1 year default)
   features: [{ type: String }],
   maxSkills: { type: Number, default: 4 },
   unlockCredits: { type: Number, default: 0 },

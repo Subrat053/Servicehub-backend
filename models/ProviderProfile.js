@@ -5,7 +5,7 @@ const providerProfileSchema = new mongoose.Schema({
   skills: [{ type: String, trim: true }],
   tier: { type: String, enum: ['unskilled', 'semi-skilled', 'skilled'], default: 'unskilled' },
   experience: { type: String, default: '' },
-  city: { type: String, required: true, trim: true },
+  city: { type: String, default: '', trim: true },
   state: { type: String, default: '', trim: true },
   languages: [{ type: String }],
   description: { type: String, default: '' },

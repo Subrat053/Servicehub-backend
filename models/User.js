@@ -14,12 +14,22 @@ const userSchema = new mongoose.Schema({
   isEmailVerified: { type: Boolean, default: false },
   isPhoneVerified: { type: Boolean, default: false },
   whatsappConsent: { type: Boolean, default: false },
+  whatsappNumber: { type: String, default: '' },
+  whatsappAlerts: { type: Boolean, default: true },
   isActive: { type: Boolean, default: true },
   isBlocked: { type: Boolean, default: false },
   termsAccepted: { type: Boolean, default: false },
   lastLogin: { type: Date },
   deviceInfo: { type: String, default: '' },
   ipAddress: { type: String, default: '' },
+  // Localization
+  locale: { type: String, enum: ['en', 'hi', 'ar'], default: 'en' },
+  country: { type: String, enum: ['IN', 'AE'], default: 'IN' },
+  currency: { type: String, enum: ['INR', 'AED', 'USD'], default: 'INR' },
+  // Subscription validity
+  accountExpiresAt: { type: Date },
+  renewalReminderSent: { type: Boolean, default: false },
+  renewalReminder2Sent: { type: Boolean, default: false },
 }, { timestamps: true });
 
 userSchema.pre('save', async function (next) {
