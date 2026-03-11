@@ -2,8 +2,11 @@ const cron = require('node-cron');
 const User = require('../models/User');
 const ProviderProfile = require('../models/ProviderProfile');
 const RecruiterProfile = require('../models/RecruiterProfile');
+const UserSubscription = require('../models/UserSubscription');
+const Plan = require('../models/Plan');
 const WhatsappLog = require('../models/WhatsappLog');
 const { sendWhatsAppMessage, formatPhoneNumber } = require('./messaging');
+const { clearUserBadge } = require('../services/badgeService');
 
 /**
  * Check subscription expiry and send renewal reminders
@@ -16,6 +19,7 @@ const startCronJobs = () => {
     try {
       await checkProviderRenewals();
       await checkRecruiterRenewals();
+      await revertExpiredSubscriptions();
     } catch (err) {
       console.error('[CRON] Renewal check error:', err.message);
     }
@@ -170,6 +174,64 @@ async function cleanupExpiredProfiles() {
 
   if (expired.length > 0) {
     console.log(`[CRON] Removed ${expired.length} expired providers from rotation pools`);
+  }
+}
+
+/**
+ * Revert expired subscriptions to the free plan.
+ * Marks expired UserSubscription records and assigns a free plan.
+ */
+async function revertExpiredSubscriptions() {
+  const now = new Date();
+
+  // Find all active subscriptions that have expired
+  const expiredSubs = await UserSubscription.find({
+    status: 'active',
+    endDate: { $lt: now },
+  }).populate('userId', 'role');
+
+  let reverted = 0;
+  for (const sub of expiredSubs) {
+    sub.status = 'expired';
+    await sub.save();
+
+    if (!sub.userId) continue;
+
+    // Find the free plan for this user's role
+    const planType = sub.userId.role === 'recruiter' ? 'recruiter' : 'provider';
+    const freePlan = await Plan.findOne({ type: planType, price: 0, isActive: true }).sort({ sortOrder: 1 });
+
+    if (freePlan) {
+      await UserSubscription.create({
+        userId: sub.userId._id,
+        planId: freePlan._id,
+        startDate: now,
+        endDate: new Date(now.getTime() + freePlan.duration * 24 * 60 * 60 * 1000),
+        status: 'active',
+      });
+
+      // Update profile plan slug to free
+      if (sub.userId.role === 'provider') {
+        await ProviderProfile.findOneAndUpdate({ user: sub.userId._id }, {
+          currentPlan: 'free',
+          boostWeight: 0,
+          isTopCity: false,
+          inRotationPool: false,
+        });
+      } else if (sub.userId.role === 'recruiter') {
+        await RecruiterProfile.findOneAndUpdate({ user: sub.userId._id }, {
+          currentPlan: 'free',
+        });
+      }
+    }
+
+    // Clear badge
+    await clearUserBadge(sub.userId._id);
+    reverted++;
+  }
+
+  if (reverted > 0) {
+    console.log(`[CRON] Reverted ${reverted} expired subscriptions to free plan`);
   }
 }
 

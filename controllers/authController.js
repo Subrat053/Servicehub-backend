@@ -4,6 +4,7 @@ const RecruiterProfile = require('../models/RecruiterProfile');
 const Otp = require('../models/Otp');
 const generateToken = require('../utils/generateToken');
 const { generateOTP, sendPhoneOTP, sendEmailOTP, sendWhatsAppMessage } = require('../utils/messaging');
+const { assignFreePlan } = require('./subscriptionController');
 
 // Helper: detect country from IP (simple heuristic)
 function detectCountryFromIP(ip) {
@@ -70,6 +71,9 @@ const registerEmail = async (req, res) => {
         profileExpiresAt: new Date(Date.now() + VALIDITY_DAYS * 24 * 60 * 60 * 1000),
       });
     }
+
+    // Auto-assign free plan subscription
+    await assignFreePlan(user._id, role);
 
     const token = generateToken(user._id, user.role);
 
@@ -222,6 +226,9 @@ const googleAuth = async (req, res) => {
         });
       }
       isNewUser = true;
+
+      // Auto-assign free plan subscription
+      await assignFreePlan(user._id, role);
     }
 
     const token = generateToken(user._id, user.role);
@@ -336,6 +343,9 @@ const whatsappVerifyOtp = async (req, res) => {
       }
       isNewUser = true;
       await sendWhatsAppMessage(phone, 'welcome', { name: user.name });
+
+      // Auto-assign free plan subscription
+      await assignFreePlan(user._id, role);
     }
 
     const token = generateToken(user._id, user.role);

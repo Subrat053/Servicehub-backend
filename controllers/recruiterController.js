@@ -9,8 +9,12 @@ const RotationPool = require('../models/RotationPool');
 const User = require('../models/User');
 const VisitHistory = require('../models/VisitHistory');
 const WhatsappLog = require('../models/WhatsappLog');
+const Application = require('../models/Application');
 const { sendWhatsAppMessage } = require('../utils/messaging');
 const { uploadToCloudinary, deleteFromCloudinary } = require('../utils/cloudinary');
+const { notifyProvidersOfNewJob } = require('../services/notificationService');
+const { getActiveSubscription } = require('../middleware/subscription');
+const { assignPlanToUser } = require('./subscriptionController');
 const path = require('path');
 const fs = require('fs');
 
@@ -36,12 +40,28 @@ const getDashboard = async (req, res) => {
         select: 'name',
       });
 
+    // Subscription data
+    const { plan } = await getActiveSubscription(req.user._id);
+    const now = new Date();
+    const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
+    const jobsThisMonth = await JobPost.countDocuments({ recruiter: req.user._id, createdAt: { $gte: startOfMonth } });
+    const totalApplicationsReceived = await Application.countDocuments({
+      jobPost: { $in: jobs.map(j => j._id) },
+    });
+
+    const remainingPostLimit = plan
+      ? (plan.jobPostLimit === -1 ? 'unlimited' : Math.max(0, plan.jobPostLimit - jobsThisMonth))
+      : 0;
+
     res.json({
       profile,
       jobs,
       recentUnlocks,
       stats: {
         totalJobsPosted: profile.totalJobsPosted,
+        totalApplicationsReceived,
+        remainingPostLimit,
+        subscriptionPlan: plan ? plan.name : 'None',
         totalUnlocks: profile.totalUnlocks,
         freeProfileViews: profile.freeProfileViews,
         unlocksRemaining: profile.unlocksRemaining,
@@ -84,6 +104,9 @@ const updateProfile = async (req, res) => {
   }
 };
 
+// Escape special regex characters in user input
+const escapeRegex = (str) => str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
 // @desc    Search providers
 // @route   GET /api/recruiter/search?skill=&city=&rating=&experience=&verified=&page=&limit=
 const searchProviders = async (req, res) => {
@@ -91,11 +114,19 @@ const searchProviders = async (req, res) => {
     const { skill, city, tier, rating, experience, verified, page = 1, limit = 20 } = req.query;
 
     const filter = {};
-    if (skill) filter.skills = { $regex: skill, $options: 'i' };
-    if (city) filter.city = { $regex: city, $options: 'i' };
+    // Skill: substring match (e.g. "Tutor" matches "Online tutor")
+    if (skill) filter.skills = { $regex: escapeRegex(skill.trim()), $options: 'i' };
+    if (city) {
+      // City: prefix-tolerant regex – trims 1 trailing char to absorb typos like "Kolkataa" → "Kolkata"
+      const cityQuery = city.trim();
+      const cityPrefix = cityQuery.length > 4
+        ? cityQuery.slice(0, cityQuery.length - 1)
+        : cityQuery;
+      filter.city = { $regex: '^' + escapeRegex(cityPrefix), $options: 'i' };
+    }
     if (tier) filter.tier = tier;
     if (rating) filter.rating = { $gte: parseFloat(rating) };
-    if (experience) filter.experience = { $regex: experience, $options: 'i' };
+    if (experience) filter.experience = { $regex: escapeRegex(experience), $options: 'i' };
     if (verified === 'true') filter.isVerified = true;
     filter.isApproved = true;
 
@@ -154,13 +185,29 @@ const searchProviders = async (req, res) => {
       .limit(5);
 
     // Get normal providers
-    const normal = await ProviderProfile.find(filter)
+    let normal = await ProviderProfile.find(filter)
       .populate('user', 'name avatar email')
       .sort({ boostWeight: -1, rating: -1, createdAt: -1 })
       .skip(skip)
       .limit(parseInt(limit));
 
-    const total = await ProviderProfile.countDocuments(filter);
+    let total = await ProviderProfile.countDocuments(filter);
+
+    // 2-pass fallback: if skill+city combo returns 0, retry with skill only
+    // (city may have a typo that prefix-regex couldn't absorb)
+    if (total === 0 && skill && city) {
+      const skillOnlyFilter = { isApproved: true, skills: { $regex: escapeRegex(skill.trim()), $options: 'i' } };
+      if (tier) skillOnlyFilter.tier = tier;
+      if (rating) skillOnlyFilter.rating = { $gte: parseFloat(rating) };
+      if (experience) skillOnlyFilter.experience = { $regex: escapeRegex(experience), $options: 'i' };
+      if (verified === 'true') skillOnlyFilter.isVerified = true;
+      normal = await ProviderProfile.find(skillOnlyFilter)
+        .populate('user', 'name avatar email')
+        .sort({ boostWeight: -1, rating: -1, createdAt: -1 })
+        .skip(skip)
+        .limit(parseInt(limit));
+      total = await ProviderProfile.countDocuments(skillOnlyFilter);
+    }
 
     // Track recruiter free view + save search history
     if (req.user && req.user.role === 'recruiter') {
@@ -398,6 +445,7 @@ const unlockContact = async (req, res) => {
 
 // @desc    Post a job
 // @route   POST /api/recruiter/jobs
+// Note: checkPostLimit middleware validates subscription limits before this runs
 const postJob = async (req, res) => {
   try {
     const { title, skill, city, budgetMin, budgetMax, budgetType, description, requirements } = req.body;
@@ -454,6 +502,9 @@ const postJob = async (req, res) => {
     job.matchedProviders = matchedProviders.map(p => p._id);
     await job.save();
 
+    // Notify providers with notification-enabled subscriptions (in-app + socket.io)
+    await notifyProvidersOfNewJob(job);
+
     res.status(201).json({ message: 'Job posted successfully', job, matchedCount: matchedProviders.length });
   } catch (error) {
     res.status(500).json({ message: 'Server error', error: error.message });
@@ -506,6 +557,9 @@ const purchasePlan = async (req, res) => {
     profile.unlocksRemaining += plan.unlockCredits || 0;
     profile.unlockPackSize = plan.unlockCredits || 0;
     await profile.save();
+
+    // Create UserSubscription record and update badge
+    await assignPlanToUser(req.user._id, plan);
 
     res.json({ message: 'Plan purchased successfully', payment, profile });
   } catch (error) {
@@ -565,11 +619,7 @@ const uploadProfilePhoto = async (req, res) => {
       });
       newUrl = result.secure_url;
     } catch (cloudErr) {
-      const ext = path.extname(req.file.originalname);
-      const filename = `${Date.now()}-${Math.round(Math.random()*1e9)}${ext}`;
-      const filepath = path.join(__dirname, '../uploads/', filename);
-      fs.writeFileSync(filepath, req.file.buffer);
-      newUrl = `/uploads/${filename}`;
+      return res.status(500).json({ message: 'Cloudinary upload failed', error: cloudErr.message });
     }
 
     const profile = await RecruiterProfile.findOne({ user: req.user._id });

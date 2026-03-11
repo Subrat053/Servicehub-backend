@@ -17,6 +17,14 @@ const planSchema = new mongoose.Schema({
   isActive: { type: Boolean, default: true },
   country: { type: String, default: 'IN' },
   sortOrder: { type: Number, default: 0 },
+
+  // Subscription limits (configurable by admin)
+  jobPostLimit: { type: Number, default: 2 },      // -1 = unlimited
+  jobApplyLimit: { type: Number, default: 5 },      // -1 = unlimited
+  jobNotification: { type: Boolean, default: false },
+  badgeEnabled: { type: Boolean, default: false },
+  priorityListing: { type: Boolean, default: false },
+  status: { type: String, enum: ['active', 'inactive', 'archived'], default: 'active' },
 }, { timestamps: true });
 
 module.exports = mongoose.model('Plan', planSchema);

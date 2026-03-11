@@ -6,6 +6,7 @@ const ProviderProfile = require('../models/ProviderProfile');
 const RecruiterProfile = require('../models/RecruiterProfile');
 const Plan = require('../models/Plan');
 const AdminSetting = require('../models/AdminSetting');
+const JobPost = require('../models/JobPost');
 
 const connectDB = require('../config/db');
 
@@ -85,6 +86,7 @@ const seed = async () => {
     { name: 'ShopEasy', email: 'hire@shopeasy.com', phone: '9988776657', company: 'ShopEasy Store', type: 'shop', city: 'Mumbai' },
   ];
 
+  const recruiterUsers = [];
   for (const rd of recruiterData) {
     const user = await User.create({
       name: rd.name,
@@ -104,19 +106,52 @@ const seed = async () => {
       city: rd.city,
       freeViewResetAt: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),
     });
+
+    recruiterUsers.push(user);
   }
   console.log(`${recruiterData.length} recruiters created`);
 
-  // Create plans
+  // Create sample job posts for recruiters so providers can find recruiters
+  const sampleJobs = [
+    { title: 'House Painter Needed', skill: 'Painter', city: 'Mumbai', budgetMin: 5000, budgetMax: 12000, budgetType: 'fixed', description: 'Looking for an experienced house painter for 3 rooms.', requirements: ['Experience painting interiors', 'Own tools'] },
+    { title: 'Math Tutor - Grade 10', skill: 'Tutor', city: 'Delhi', budgetMin: 500, budgetMax: 1000, budgetType: 'hourly', description: 'Looking for a patient math tutor for grade 10 student.', requirements: ['Teaching experience', 'Good communication'] },
+    { title: 'Web Designer for Small Business', skill: 'Web Designer', city: 'Bangalore', budgetMin: 8000, budgetMax: 20000, budgetType: 'fixed', description: 'Design a 5-page website for a local business.', requirements: ['Portfolio', 'Responsive design'] },
+    { title: 'Cook for Events', skill: 'Cook', city: 'Delhi', budgetMin: 10000, budgetMax: 25000, budgetType: 'fixed', description: 'Experienced cook required for catering small events.', requirements: ['Catering experience', 'Hygiene certifications'] },
+  ];
+
+  let jobsCreated = 0;
+  for (let i = 0; i < sampleJobs.length; i++) {
+    const recruiter = recruiterUsers[i % recruiterUsers.length];
+    const job = sampleJobs[i];
+    await JobPost.create({
+      recruiter: recruiter._id,
+      title: job.title,
+      skill: job.skill,
+      city: job.city,
+      budgetMin: job.budgetMin,
+      budgetMax: job.budgetMax,
+      budgetType: job.budgetType,
+      description: job.description,
+      requirements: job.requirements,
+      status: 'active',
+      expiresAt: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),
+    });
+    jobsCreated++;
+  }
+  console.log(`${jobsCreated} sample job posts created`);
+
+  // Create plans (including free plans)
   const plans = [
     // Provider plans
-    { name: 'Basic Boost', slug: 'basic', type: 'provider', price: 2000, duration: 30, features: ['Profile boosted in search', 'Up to 6 skills', 'Priority listing'], maxSkills: 6, boostWeight: 2, isRotationEligible: false, sortOrder: 1 },
-    { name: 'Pro Boost', slug: 'pro', type: 'provider', price: 5000, duration: 30, features: ['All Basic features', 'Up to 10 skills', 'Featured badge', 'WhatsApp lead alerts'], maxSkills: 10, boostWeight: 5, isRotationEligible: false, sortOrder: 2 },
-    { name: 'Featured', slug: 'featured', type: 'provider', price: 10000, duration: 30, features: ['All Pro features', 'Unlimited skills', 'Top rotation pool', 'Priority WhatsApp alerts', 'Verified badge'], maxSkills: 999, boostWeight: 10, isRotationEligible: true, sortOrder: 3 },
+    { name: 'Free', slug: 'free', type: 'provider', price: 0, duration: 365, features: ['Basic profile', 'Up to 4 skills'], maxSkills: 4, boostWeight: 0, isRotationEligible: false, isActive: true, sortOrder: 0, jobPostLimit: 0, jobApplyLimit: 5, jobNotification: false, badgeEnabled: false, priorityListing: false },
+    { name: 'Basic Boost', slug: 'basic', type: 'provider', price: 2000, duration: 30, features: ['Profile boosted in search', 'Up to 6 skills', 'Priority listing'], maxSkills: 6, boostWeight: 2, isRotationEligible: false, isActive: true, sortOrder: 1, jobPostLimit: 0, jobApplyLimit: 20, jobNotification: true, badgeEnabled: false, priorityListing: false },
+    { name: 'Pro Boost', slug: 'pro', type: 'provider', price: 5000, duration: 30, features: ['All Basic features', 'Up to 10 skills', 'Featured badge', 'WhatsApp lead alerts'], maxSkills: 10, boostWeight: 5, isRotationEligible: false, isActive: true, sortOrder: 2, jobPostLimit: 0, jobApplyLimit: -1, jobNotification: true, badgeEnabled: true, priorityListing: true },
+    { name: 'Featured', slug: 'featured', type: 'provider', price: 10000, duration: 30, features: ['All Pro features', 'Unlimited skills', 'Top rotation pool', 'Priority WhatsApp alerts', 'Verified badge'], maxSkills: 999, boostWeight: 10, isRotationEligible: true, isActive: true, sortOrder: 3, jobPostLimit: 0, jobApplyLimit: -1, jobNotification: true, badgeEnabled: true, priorityListing: true },
     // Recruiter plans
-    { name: 'Starter Pack', slug: 'starter', type: 'recruiter', price: 999, duration: 30, features: ['25 contact unlocks', 'Extended search', 'Save favorites'], unlockCredits: 25, sortOrder: 1 },
-    { name: 'Business Pack', slug: 'business', type: 'recruiter', price: 2999, duration: 30, features: ['100 contact unlocks', 'Unlimited search', 'Priority support', 'Bulk actions'], unlockCredits: 100, sortOrder: 2 },
-    { name: 'Enterprise', slug: 'enterprise', type: 'recruiter', price: 9999, duration: 90, features: ['Unlimited unlocks', 'Unlimited search', 'Dedicated account manager', 'API access', 'Custom reports'], unlockCredits: 9999, sortOrder: 3 },
+    { name: 'Free', slug: 'free-recruiter', type: 'recruiter', price: 0, duration: 365, features: ['Basic access', '2 job posts/month'], unlockCredits: 0, isActive: true, sortOrder: 0, jobPostLimit: 2, jobApplyLimit: 0, jobNotification: false, badgeEnabled: false, priorityListing: false },
+    { name: 'Starter Pack', slug: 'starter', type: 'recruiter', price: 999, duration: 30, features: ['25 contact unlocks', 'Extended search', 'Save favorites', '10 job posts/month'], unlockCredits: 25, isActive: true, sortOrder: 1, jobPostLimit: 10, jobApplyLimit: 0, jobNotification: true, badgeEnabled: false, priorityListing: false },
+    { name: 'Business Pack', slug: 'business', type: 'recruiter', price: 2999, duration: 30, features: ['100 contact unlocks', 'Unlimited search', 'Priority support', 'Bulk actions', 'Unlimited job posts'], unlockCredits: 100, isActive: true, sortOrder: 2, jobPostLimit: -1, jobApplyLimit: 0, jobNotification: true, badgeEnabled: true, priorityListing: true },
+    { name: 'Enterprise', slug: 'enterprise', type: 'recruiter', price: 9999, duration: 90, features: ['Unlimited unlocks', 'Unlimited search', 'Dedicated account manager', 'API access', 'Custom reports'], unlockCredits: 9999, isActive: true, sortOrder: 3, jobPostLimit: -1, jobApplyLimit: 0, jobNotification: true, badgeEnabled: true, priorityListing: true },
   ];
 
   for (const p of plans) {

@@ -17,6 +17,7 @@ const {
   checkUnlockStatus,
 } = require('../controllers/recruiterController');
 const { protect, authorize } = require('../middleware/auth');
+const { checkPostLimit } = require('../middleware/subscription');
 const upload = require('../middleware/upload');
 
 router.get('/dashboard', protect, authorize('recruiter'), getDashboard);
@@ -25,7 +26,7 @@ router.get('/search', searchProviders);
 router.get('/view-provider/:id', protect, authorize('recruiter'), viewProvider);
 router.post('/unlock/:providerId', protect, authorize('recruiter'), unlockContact);
 router.get('/unlock-status/:providerId', protect, authorize('recruiter'), checkUnlockStatus);
-router.post('/jobs', protect, authorize('recruiter'), postJob);
+router.post('/jobs', protect, authorize('recruiter'), checkPostLimit, postJob);
 router.get('/jobs', protect, authorize('recruiter'), getMyJobs);
 router.get('/plans', protect, authorize('recruiter'), getPlans);
 router.post('/plans/purchase', protect, authorize('recruiter'), purchasePlan);

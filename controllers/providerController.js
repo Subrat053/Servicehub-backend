@@ -7,8 +7,12 @@ const Plan = require('../models/Plan');
 const Review = require('../models/Review');
 const VisitHistory = require('../models/VisitHistory');
 const WhatsappLog = require('../models/WhatsappLog');
+const JobPost = require('../models/JobPost');
+const Application = require('../models/Application');
 const { uploadToCloudinary, deleteFromCloudinary } = require('../utils/cloudinary');
 const { sendWhatsAppMessage } = require('../utils/messaging');
+const { getActiveSubscription } = require('../middleware/subscription');
+const { assignPlanToUser } = require('./subscriptionController');
 const path = require('path');
 const fs = require('fs');
 
@@ -147,6 +151,26 @@ const getDashboard = async (req, res) => {
       .limit(10)
       .populate('recruiter', 'name');
 
+    // Subscription data
+    const { plan } = await getActiveSubscription(req.user._id);
+    const user = await User.findById(req.user._id).select('subscriptionBadge');
+    const now = new Date();
+    const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
+
+    const [availableJobs, appliedJobs] = await Promise.all([
+      JobPost.countDocuments({ status: 'active', expiresAt: { $gt: now } }),
+      Application.countDocuments({ provider: req.user._id }),
+    ]);
+
+    const appliedThisMonth = await Application.countDocuments({
+      provider: req.user._id,
+      createdAt: { $gte: startOfMonth },
+    });
+
+    const remainingApplyLimit = plan
+      ? (plan.jobApplyLimit === -1 ? 'unlimited' : Math.max(0, plan.jobApplyLimit - appliedThisMonth))
+      : 0;
+
     res.json({
       profile,
       leads,
@@ -158,6 +182,10 @@ const getDashboard = async (req, res) => {
         profileCompletion: profile.profileCompletion,
         currentPlan: profile.currentPlan,
         profileExpiresAt: profile.profileExpiresAt,
+        availableJobs,
+        appliedJobs,
+        remainingApplyLimit,
+        subscriptionBadge: user?.subscriptionBadge || '',
       },
     });
   } catch (error) {
@@ -210,6 +238,9 @@ const purchasePlan = async (req, res) => {
         await updateRotationPool(skill, profile.city, profile._id);
       }
     }
+
+    // Create UserSubscription record and update badge
+    await assignPlanToUser(req.user._id, plan);
 
     res.json({ message: 'Plan purchased successfully', payment, profile });
   } catch (error) {
@@ -275,19 +306,14 @@ const uploadProfilePhoto = async (req, res) => {
 
     let newUrl;
     try {
-      // Try Cloudinary upload
+      // Upload must go to Cloudinary; fail if not configured or upload fails
       const result = await uploadToCloudinary(req.file.buffer, {
         folder: 'servicehub/providers',
         public_id: `provider_${req.user._id}_${Date.now()}`,
       });
       newUrl = result.secure_url;
     } catch (cloudErr) {
-      // Fallback to disk storage
-      const ext = path.extname(req.file.originalname);
-      const filename = `${Date.now()}-${Math.round(Math.random()*1e9)}${ext}`;
-      const filepath = path.join(__dirname, '../uploads/', filename);
-      fs.writeFileSync(filepath, req.file.buffer);
-      newUrl = `/uploads/${filename}`;
+      return res.status(500).json({ message: 'Cloudinary upload failed', error: cloudErr.message });
     }
 
     // Delete old Cloudinary file
@@ -350,11 +376,7 @@ const uploadDocument = async (req, res) => {
       });
       url = result.secure_url;
     } catch (cloudErr) {
-      const ext = path.extname(req.file.originalname);
-      const filename = `${Date.now()}-${Math.round(Math.random()*1e9)}${ext}`;
-      const filepath = path.join(__dirname, '../uploads/', filename);
-      fs.writeFileSync(filepath, req.file.buffer);
-      url = `/uploads/${filename}`;
+      return res.status(500).json({ message: 'Cloudinary upload failed', error: cloudErr.message });
     }
 
     const profile = await ProviderProfile.findOne({ user: req.user._id });

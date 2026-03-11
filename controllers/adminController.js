@@ -11,6 +11,7 @@ const RotationPool = require('../models/RotationPool');
 const WhatsappLog = require('../models/WhatsappLog');
 const Review = require('../models/Review');
 const VisitHistory = require('../models/VisitHistory');
+const UserSubscription = require('../models/UserSubscription');
 const { uploadToCloudinary, deleteFromCloudinary } = require('../utils/cloudinary');
 const path = require('path');
 const fs = require('fs');
@@ -28,6 +29,8 @@ const getDashboard = async (req, res) => {
       totalPayments,
       recentUsers,
       revenueAgg,
+      activeSubscriptions,
+      monthlyRevenueAgg,
     ] = await Promise.all([
       User.countDocuments(),
       User.countDocuments({ role: 'provider' }),
@@ -38,6 +41,11 @@ const getDashboard = async (req, res) => {
       User.find().sort({ createdAt: -1 }).limit(10).select('name email role createdAt'),
       Payment.aggregate([
         { $match: { status: 'completed' } },
+        { $group: { _id: null, total: { $sum: '$amount' } } },
+      ]),
+      UserSubscription.countDocuments({ status: 'active', endDate: { $gt: new Date() } }),
+      Payment.aggregate([
+        { $match: { status: 'completed', createdAt: { $gte: new Date(new Date().getFullYear(), new Date().getMonth(), 1) } } },
         { $group: { _id: null, total: { $sum: '$amount' } } },
       ]),
     ]);
@@ -51,6 +59,8 @@ const getDashboard = async (req, res) => {
         totalLeads,
         totalPayments,
         totalRevenue: revenueAgg.length > 0 ? revenueAgg[0].total : 0,
+        activeSubscriptions,
+        monthlyRevenue: monthlyRevenueAgg.length > 0 ? monthlyRevenueAgg[0].total : 0,
       },
       recentUsers,
     });
@@ -316,11 +326,7 @@ const uploadProfilePhoto = async (req, res) => {
       });
       url = result.secure_url;
     } catch (cloudErr) {
-      const ext = path.extname(req.file.originalname);
-      const filename = `${Date.now()}-${Math.round(Math.random()*1e9)}${ext}`;
-      const filepath = path.join(__dirname, '../uploads/', filename);
-      fs.writeFileSync(filepath, req.file.buffer);
-      url = `/uploads/${filename}`;
+      return res.status(500).json({ message: 'Cloudinary upload failed', error: cloudErr.message });
     }
     await User.findByIdAndUpdate(req.user._id, { profilePhoto: url, avatar: url });
     res.json({ url });

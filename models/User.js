@@ -30,6 +30,8 @@ const userSchema = new mongoose.Schema({
   accountExpiresAt: { type: Date },
   renewalReminderSent: { type: Boolean, default: false },
   renewalReminder2Sent: { type: Boolean, default: false },
+  // Badge
+  subscriptionBadge: { type: String, default: '' },
 }, { timestamps: true });
 
 userSchema.pre('save', async function (next) {

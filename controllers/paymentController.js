@@ -4,6 +4,8 @@ const ProviderProfile = require('../models/ProviderProfile');
 const RecruiterProfile = require('../models/RecruiterProfile');
 const RotationPool = require('../models/RotationPool');
 const { getStripeInstance, getPaymentConfig } = require('../utils/stripe');
+const { updateUserBadge } = require('../services/badgeService');
+const UserSubscription = require('../models/UserSubscription');
 
 // Helper: update rotation pool
 async function updateRotationPool(skill, city, profileId) {
@@ -41,6 +43,18 @@ async function activateProviderPlan(userId, plan) {
       await updateRotationPool(skill, profile.city, profile._id);
     }
   }
+
+  // Create UserSubscription and update badge
+  await UserSubscription.updateMany({ userId, status: 'active' }, { status: 'expired' });
+  await UserSubscription.create({
+    userId,
+    planId: plan._id,
+    startDate: new Date(),
+    endDate: new Date(Date.now() + plan.duration * 24 * 60 * 60 * 1000),
+    status: 'active',
+  });
+  await updateUserBadge(userId);
+
   return profile;
 }
 
@@ -53,6 +67,18 @@ async function activateRecruiterPlan(userId, plan) {
   profile.unlocksRemaining += plan.unlockCredits || 0;
   profile.unlockPackSize = plan.unlockCredits || 0;
   await profile.save();
+
+  // Create UserSubscription and update badge
+  await UserSubscription.updateMany({ userId, status: 'active' }, { status: 'expired' });
+  await UserSubscription.create({
+    userId,
+    planId: plan._id,
+    startDate: new Date(),
+    endDate: new Date(Date.now() + plan.duration * 24 * 60 * 60 * 1000),
+    status: 'active',
+  });
+  await updateUserBadge(userId);
+
   return profile;
 }
 
