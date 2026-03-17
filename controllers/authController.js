@@ -4,7 +4,9 @@ const RecruiterProfile = require('../models/RecruiterProfile');
 const Otp = require('../models/Otp');
 const generateToken = require('../utils/generateToken');
 const { generateOTP, sendPhoneOTP, sendEmailOTP, sendWhatsAppMessage } = require('../utils/messaging');
-const { assignFreePlan } = require('./subscriptionController');
+const { assignFreePlan, ensureDefaultProviderSubscription } = require('./subscriptionController');
+
+const SUPPORTED_LOCALES = new Set(['en', 'hi', 'ar', 'ur', 'zh', 'ja', 'es', 'fr', 'de', 'ru', 'pt', 'id', 'bn', 'ta', 'te', 'mr']);
 
 // Helper: detect country from IP (simple heuristic)
 function detectCountryFromIP(ip) {
@@ -72,8 +74,12 @@ const registerEmail = async (req, res) => {
       });
     }
 
-    // Auto-assign free plan subscription
-    await assignFreePlan(user._id, role);
+    // Auto-assign default provider plan or free recruiter plan
+    if (role === 'provider') {
+      await ensureDefaultProviderSubscription(user._id, { startDate: user.createdAt });
+    } else {
+      await assignFreePlan(user._id, role);
+    }
 
     const token = generateToken(user._id, user.role);
 
@@ -113,6 +119,10 @@ const loginUser = async (req, res) => {
     user.lastLogin = new Date();
     user.ipAddress = req.ip;
     await user.save();
+
+    if (user.role === 'provider') {
+      await ensureDefaultProviderSubscription(user._id);
+    }
 
     const token = generateToken(user._id, user.role);
 
@@ -194,6 +204,10 @@ const googleAuth = async (req, res) => {
           isNewUser = true;
         }
       }
+
+      if (user.role === 'provider') {
+        await ensureDefaultProviderSubscription(user._id);
+      }
     } else {
       // New user - signup
       if (!role) {
@@ -227,8 +241,12 @@ const googleAuth = async (req, res) => {
       }
       isNewUser = true;
 
-      // Auto-assign free plan subscription
-      await assignFreePlan(user._id, role);
+      // Auto-assign default provider plan or free recruiter plan
+      if (role === 'provider') {
+        await ensureDefaultProviderSubscription(user._id, { startDate: user.createdAt });
+      } else {
+        await assignFreePlan(user._id, role);
+      }
     }
 
     const token = generateToken(user._id, user.role);
@@ -313,6 +331,10 @@ const whatsappVerifyOtp = async (req, res) => {
           isNewUser = true;
         }
       }
+
+      if (user.role === 'provider') {
+        await ensureDefaultProviderSubscription(user._id);
+      }
     } else {
       // New user
       if (!name || !role) {
@@ -344,8 +366,12 @@ const whatsappVerifyOtp = async (req, res) => {
       isNewUser = true;
       await sendWhatsAppMessage(phone, 'welcome', { name: user.name });
 
-      // Auto-assign free plan subscription
-      await assignFreePlan(user._id, role);
+      // Auto-assign default provider plan or free recruiter plan
+      if (role === 'provider') {
+        await ensureDefaultProviderSubscription(user._id, { startDate: user.createdAt });
+      } else {
+        await assignFreePlan(user._id, role);
+      }
     }
 
     const token = generateToken(user._id, user.role);
@@ -450,15 +476,44 @@ const updateWhatsappNumber = async (req, res) => {
 // @route   PUT /api/auth/locale
 const updateLocale = async (req, res) => {
   try {
-    const { locale, country, currency } = req.body;
+    const { locale, language, country, currency } = req.body;
     const user = await User.findById(req.user._id);
+    const nextLanguage = locale || language;
 
-    if (locale && ['en', 'hi', 'ar'].includes(locale)) user.locale = locale;
+    if (nextLanguage && SUPPORTED_LOCALES.has(nextLanguage)) {
+      user.locale = nextLanguage;
+      user.preferredLanguage = nextLanguage;
+    }
     if (country && ['IN', 'AE'].includes(country)) user.country = country;
     if (currency && ['INR', 'AED', 'USD'].includes(currency)) user.currency = currency;
     await user.save();
 
-    res.json({ locale: user.locale, country: user.country, currency: user.currency });
+    res.json({
+      locale: user.locale,
+      preferredLanguage: user.preferredLanguage || user.locale,
+      country: user.country,
+      currency: user.currency,
+    });
+  } catch (error) {
+    res.status(500).json({ message: 'Server error', error: error.message });
+  }
+};
+
+// @desc    Update user language preference
+// @route   PUT /api/user/language
+const updateLanguagePreference = async (req, res) => {
+  try {
+    const { language } = req.body;
+    if (!language || !SUPPORTED_LOCALES.has(language)) {
+      return res.status(400).json({ message: 'Unsupported language' });
+    }
+
+    const user = await User.findById(req.user._id);
+    user.locale = language;
+    user.preferredLanguage = language;
+    await user.save();
+
+    res.json({ language: user.preferredLanguage, locale: user.locale });
   } catch (error) {
     res.status(500).json({ message: 'Server error', error: error.message });
   }
@@ -497,5 +552,6 @@ module.exports = {
   getMe,
   updateWhatsappNumber,
   updateLocale,
+  updateLanguagePreference,
   toggleWhatsappAlerts,
 };

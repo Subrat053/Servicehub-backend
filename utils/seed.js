@@ -166,6 +166,9 @@ const seed = async () => {
     { key: 'rotation_pool_size', value: 5, description: 'Max providers in rotation pool per skill+city', category: 'rotation' },
     { key: 'rotation_interval_sec', value: 60, description: 'Rotation interval in seconds', category: 'rotation' },
     { key: 'profile_validity_days', value: 365, description: 'Profile active duration in days', category: 'general' },
+    { key: 'default_provider_subscription_enabled', value: true, description: 'Enable default provider subscription', category: 'pricing' },
+    { key: 'default_provider_plan_slug', value: 'basic', description: 'Default provider plan slug', category: 'pricing' },
+    { key: 'default_provider_plan_duration_days', value: 30, description: 'Default provider plan duration in days', category: 'pricing' },
     { key: 'whatsapp_welcome_template', value: 'Hello {{name}}, Welcome to ServiceHub!', description: 'Welcome WhatsApp template', category: 'whatsapp' },
     { key: 'whatsapp_lead_template', value: 'Hi {{name}}, you have a new lead from {{recruiter}}!', description: 'New lead WhatsApp template', category: 'whatsapp' },
   ];

@@ -6,6 +6,7 @@ const userSubscriptionSchema = new mongoose.Schema({
   startDate: { type: Date, default: Date.now },
   endDate: { type: Date, required: true },
   status: { type: String, enum: ['active', 'expired', 'cancelled'], default: 'active' },
+  isDefault: { type: Boolean, default: false },
   autoRenew: { type: Boolean, default: false },
 }, { timestamps: true });
 

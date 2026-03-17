@@ -104,7 +104,7 @@ const getMyApplications = async (req, res) => {
       .populate({
         path: 'jobPost',
         select: 'title skill city budgetMin budgetMax budgetType status recruiter',
-        populate: { path: 'recruiter', select: 'name' },
+          populate: { path: 'recruiter', select: 'name email phone' },
       })
       .sort({ createdAt: -1 });
     res.json({ applications });

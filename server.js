@@ -82,6 +82,7 @@ app.get('/api/skills', async (req, res) => {
 
 // Routes
 app.use('/api/auth', authRoutes);
+app.use('/api/user', require('./routes/userRoutes'));
 app.use('/api/provider', providerRoutes);
 app.use('/api/recruiter', recruiterRoutes);
 app.use('/api/admin', adminRoutes);
@@ -99,11 +100,33 @@ app.get('/api/health', (req, res) => {
 // Localization: detect country from request
 app.get('/api/locale/detect', (req, res) => {
   // Simple IP-based detection (can be enhanced with GeoIP)
-  const ip = req.ip || req.connection.remoteAddress || '';
   // Default to India; UAE detection can be added with GeoIP service
-  const country = 'IN';
-  const currency = country === 'AE' ? 'AED' : 'INR';
-  const locale = 'en';
+  let country = 'IN';
+  let currency = country === 'AE' ? 'AED' : 'INR';
+  let locale = 'en';
+
+  const auth = req.headers.authorization;
+  if (auth && auth.startsWith('Bearer')) {
+    try {
+      const jwt = require('jsonwebtoken');
+      const User = require('./models/User');
+      const decoded = jwt.verify(auth.split(' ')[1], process.env.JWT_SECRET);
+      if (decoded?.id) {
+        User.findById(decoded.id).select('country currency locale').then((user) => {
+          if (user) {
+            country = user.country || country;
+            currency = user.currency || currency;
+            locale = user.locale || locale;
+          }
+          res.json({ country, currency, locale });
+        }).catch(() => res.json({ country, currency, locale }));
+        return;
+      }
+    } catch (_) {
+      // fall back to defaults
+    }
+  }
+
   res.json({ country, currency, locale });
 });
 

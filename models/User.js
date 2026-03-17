@@ -23,7 +23,16 @@ const userSchema = new mongoose.Schema({
   deviceInfo: { type: String, default: '' },
   ipAddress: { type: String, default: '' },
   // Localization
-  locale: { type: String, enum: ['en', 'hi', 'ar'], default: 'en' },
+  locale: {
+    type: String,
+    enum: ['en', 'hi', 'ar', 'ur', 'zh', 'ja', 'es', 'fr', 'de', 'ru', 'pt', 'id', 'bn', 'ta', 'te', 'mr'],
+    default: 'en',
+  },
+  preferredLanguage: {
+    type: String,
+    enum: ['en', 'hi', 'ar', 'ur', 'zh', 'ja', 'es', 'fr', 'de', 'ru', 'pt', 'id', 'bn', 'ta', 'te', 'mr'],
+    default: 'en',
+  },
   country: { type: String, enum: ['IN', 'AE'], default: 'IN' },
   currency: { type: String, enum: ['INR', 'AED', 'USD'], default: 'INR' },
   // Subscription validity

@@ -12,7 +12,7 @@ const Application = require('../models/Application');
 const { uploadToCloudinary, deleteFromCloudinary } = require('../utils/cloudinary');
 const { sendWhatsAppMessage } = require('../utils/messaging');
 const { getActiveSubscription } = require('../middleware/subscription');
-const { assignPlanToUser } = require('./subscriptionController');
+const { assignPlanToUser, ensureDefaultProviderSubscription } = require('./subscriptionController');
 const path = require('path');
 const fs = require('fs');
 
@@ -141,6 +141,8 @@ const getDashboard = async (req, res) => {
       });
     }
 
+    await ensureDefaultProviderSubscription(req.user._id);
+
     const leads = await Lead.find({ provider: req.user._id })
       .sort({ createdAt: -1 })
       .limit(20)
@@ -152,7 +154,7 @@ const getDashboard = async (req, res) => {
       .populate('recruiter', 'name');
 
     // Subscription data
-    const { plan } = await getActiveSubscription(req.user._id);
+    const { subscription, plan } = await getActiveSubscription(req.user._id);
     const user = await User.findById(req.user._id).select('subscriptionBadge');
     const now = new Date();
     const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
@@ -171,10 +173,21 @@ const getDashboard = async (req, res) => {
       ? (plan.jobApplyLimit === -1 ? 'unlimited' : Math.max(0, plan.jobApplyLimit - appliedThisMonth))
       : 0;
 
+    const planName = plan?.name || (subscription?.isDefault ? 'Monthly' : null);
+
     res.json({
       profile,
       leads,
       reviews,
+      subscription: subscription
+        ? {
+          status: subscription.status,
+          startDate: subscription.startDate,
+          endDate: subscription.endDate,
+          isDefault: subscription.isDefault === true,
+          planName: planName || plan?.slug || 'Free',
+        }
+        : null,
       stats: {
         profileViews: profile.profileViews,
         leadsReceived: profile.leadsReceived,
@@ -182,6 +195,10 @@ const getDashboard = async (req, res) => {
         profileCompletion: profile.profileCompletion,
         currentPlan: profile.currentPlan,
         profileExpiresAt: profile.profileExpiresAt,
+        planName: planName || profile.currentPlan || 'Free',
+        planStatus: subscription?.status || 'inactive',
+        planEndDate: subscription?.endDate || null,
+        isDefaultPlan: subscription?.isDefault === true,
         availableJobs,
         appliedJobs,
         remainingApplyLimit,
