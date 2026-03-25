@@ -84,10 +84,10 @@ const applyToJob = async (req, res) => {
     // Notify the recruiter
     await createNotification({
       userId: job.recruiter,
-      type: 'application_received',
-      title: 'New Application',
-      message: `${req.user.name} applied to "${job.title}"`,
-      metadata: { jobId: job._id, applicationId: application._id, providerId: req.user._id },
+      type: 'NEW_LEAD',
+      title: 'New Lead',
+      message: 'You have a new lead',
+      data: { jobId: job._id, applicationId: application._id, providerId: req.user._id },
     });
 
     res.status(201).json({ message: 'Application submitted', application });
@@ -150,10 +150,10 @@ const updateApplicationStatus = async (req, res) => {
     // Notify the provider about the status change
     await createNotification({
       userId: application.provider,
-      type: 'application_update',
+      type: 'ADMIN_ALERT',
       title: 'Application Update',
       message: `Your application for "${application.jobPost.title}" was ${status}`,
-      metadata: { applicationId: application._id, status },
+      data: { applicationId: application._id, status },
     });
 
     res.json({ message: 'Application updated', application });

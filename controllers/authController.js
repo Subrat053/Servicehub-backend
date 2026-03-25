@@ -1,98 +1,297 @@
 const User = require('../models/User');
 const ProviderProfile = require('../models/ProviderProfile');
 const RecruiterProfile = require('../models/RecruiterProfile');
+const UserSubscription = require('../models/UserSubscription');
 const Otp = require('../models/Otp');
 const generateToken = require('../utils/generateToken');
 const { generateOTP, sendPhoneOTP, sendEmailOTP, sendWhatsAppMessage } = require('../utils/messaging');
-const { assignFreePlan, ensureDefaultProviderSubscription } = require('./subscriptionController');
+const { assignFreePlan } = require('./subscriptionController');
+const {
+  SUPPORTED_LOCALES,
+  detectLocaleFromRequest,
+  normalizeCountryCode,
+  normalizeCurrencyCode,
+  normalizeLanguageCode,
+} = require('../utils/geoLocation');
 
-const SUPPORTED_LOCALES = new Set(['en', 'hi', 'ar', 'ur', 'zh', 'ja', 'es', 'fr', 'de', 'ru', 'pt', 'id', 'bn', 'ta', 'te', 'mr']);
+const VALID_ROLES = ['provider', 'recruiter'];
+const OTP_VALIDITY_MS = 10 * 60 * 1000;
+const VALIDITY_DAYS = parseInt(process.env.PROFILE_VALIDITY_DAYS || 365, 10);
 
-// Helper: detect country from IP (simple heuristic)
-function detectCountryFromIP(ip) {
-  // Default to India; actual GeoIP can be added later
-  return 'IN';
-}
-function getDefaultCurrency(country) {
-  return country === 'AE' ? 'AED' : 'INR';
-}
-function getDefaultLocale(country) {
-  if (country === 'AE') return 'en'; // UAE uses English primarily
-  return 'en';
-}
-const VALIDITY_DAYS = parseInt(process.env.PROFILE_VALIDITY_DAYS || 365);
+const issueEmailOtp = async (email) => {
+  const otp = generateOTP();
+  await Otp.create({
+    identifier: email,
+    otp,
+    type: 'email',
+    expiresAt: new Date(Date.now() + OTP_VALIDITY_MS),
+  });
+  await sendEmailOTP(email, otp);
+};
+
+const normalizeRoles = (user) => {
+  const roles = Array.isArray(user.roles) ? [...new Set(user.roles)] : [];
+  if (user.role && !roles.includes(user.role)) roles.push(user.role);
+  if (user.activeRole && !roles.includes(user.activeRole)) roles.push(user.activeRole);
+  const activeRole = user.activeRole || roles[0] || user.role || null;
+  return { roles, activeRole };
+};
+
+const parseRoleSelection = (payload = {}) => {
+  const candidateRoles = [];
+  if (Array.isArray(payload.roles)) candidateRoles.push(...payload.roles);
+  if (typeof payload.role === 'string') candidateRoles.push(payload.role);
+
+  const roles = [...new Set(candidateRoles.filter((role) => VALID_ROLES.includes(role)))];
+  const requestedActiveRole = payload.activeRole;
+  const activeRole = roles.includes(requestedActiveRole) ? requestedActiveRole : (roles[0] || null);
+
+  return { roles, activeRole };
+};
+
+const ensureRoleProfile = async (userId, role) => {
+  if (role === 'provider') {
+    let profile = await ProviderProfile.findOne({ user: userId });
+    if (!profile) {
+      profile = await ProviderProfile.create({
+        user: userId,
+        city: '',
+        profileExpiresAt: new Date(Date.now() + VALIDITY_DAYS * 24 * 60 * 60 * 1000),
+      });
+    }
+    return profile;
+  }
+
+  if (role === 'recruiter') {
+    let profile = await RecruiterProfile.findOne({ user: userId });
+    if (!profile) {
+      profile = await RecruiterProfile.create({
+        user: userId,
+        freeViewResetAt: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),
+        freeUnlockResetAt: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),
+        unlocksRemaining: 2,
+        unlockPackSize: 2,
+        profileExpiresAt: new Date(Date.now() + VALIDITY_DAYS * 24 * 60 * 60 * 1000),
+      });
+    }
+    return profile;
+  }
+
+  return null;
+};
+
+const ensureRoleSubscription = async (user, role, options = {}) => {
+  if (!VALID_ROLES.includes(role)) return;
+
+  const existing = await UserSubscription.findOne({
+    userId: user._id,
+    role,
+    status: 'active',
+    endDate: { $gt: new Date() },
+  }).sort({ createdAt: -1 });
+  if (existing) return;
+
+  await assignFreePlan(user._id, role);
+};
+
+const getProfileByRole = async (userId, role) => {
+  if (role === 'provider') return ProviderProfile.findOne({ user: userId });
+  if (role === 'recruiter') return RecruiterProfile.findOne({ user: userId });
+  return null;
+};
+
+const buildAuthPayload = (user, extra = {}) => {
+  const { roles, activeRole } = normalizeRoles(user);
+  const token = generateToken(user._id, activeRole);
+
+  return {
+    _id: user._id,
+    name: user.name,
+    email: user.email,
+    phone: user.phone,
+    whatsappNumber: user.whatsappNumber,
+    roles,
+    activeRole,
+    role: activeRole,
+    avatar: user.avatar,
+    country: user.country,
+    currency: user.currency,
+    locale: user.locale,
+    preferredLanguage: user.preferredLanguage || user.locale,
+    token,
+    ...extra,
+  };
+};
 
 // @desc    Register user with email
 // @route   POST /api/auth/register
 const registerEmail = async (req, res) => {
   try {
-    const { name, email, phone, password, role } = req.body;
+    const { name, email, phone, password } = req.body;
+    const normalizedEmail = (email || '').trim().toLowerCase();
+    const { roles: requestedRoles, activeRole: requestedActiveRole } = parseRoleSelection(req.body);
 
-    if (!name || !email || !password || !role) {
+    if (!name || !normalizedEmail || !password) {
       return res.status(400).json({ message: 'Please fill all required fields' });
     }
-    if (!['provider', 'recruiter'].includes(role)) {
-      return res.status(400).json({ message: 'Invalid role' });
+    if (password.length < 6) {
+      return res.status(400).json({ message: 'Password must be at least 6 characters' });
     }
 
-    const userExists = await User.findOne({ email });
+    const userExists = await User.findOne({ email: normalizedEmail }).select('+role');
     if (userExists) {
-      return res.status(400).json({ 
-        message: `This email is already registered as a ${userExists.role}. Please login instead or use a different email.`,
-        existingRole: userExists.role
+      if (userExists.authProvider !== 'email' || userExists.isEmailVerified) {
+        return res.status(400).json({
+          message: 'This email is already registered. Please login instead or use a different email.',
+          existingRoles: normalizeRoles(userExists).roles,
+        });
+      }
+
+      const normalized = normalizeRoles(userExists);
+      const nextRoles = [...new Set([...normalized.roles, ...requestedRoles])];
+      const nextActiveRole = requestedActiveRole || normalized.activeRole || nextRoles[0] || null;
+
+      userExists.name = name;
+      userExists.phone = phone || '';
+      userExists.password = password;
+      userExists.termsAccepted = true;
+      userExists.ipAddress = req.ip;
+      userExists.roles = nextRoles;
+      userExists.activeRole = nextActiveRole;
+      await userExists.save();
+
+      if (userExists.activeRole && VALID_ROLES.includes(userExists.activeRole)) {
+        await ensureRoleProfile(userExists._id, userExists.activeRole);
+        await ensureRoleSubscription(userExists, userExists.activeRole);
+      }
+
+      await issueEmailOtp(userExists.email);
+
+      return res.json({
+        message: 'OTP sent to your email. Please verify to complete registration.',
+        requiresEmailVerification: true,
+        email: userExists.email,
+        roles: userExists.roles || [],
+        activeRole: userExists.activeRole || null,
       });
     }
 
-    const country = detectCountryFromIP(req.ip);
+    const detectedLocale = await detectLocaleFromRequest(req);
     const user = await User.create({
       name,
-      email,
+      email: normalizedEmail,
       phone: phone || '',
       password,
-      role,
+      roles: requestedRoles,
+      activeRole: requestedActiveRole,
+      role: requestedActiveRole || null,
       authProvider: 'email',
       termsAccepted: true,
-      ipAddress: req.ip,
-      country,
-      currency: getDefaultCurrency(country),
-      locale: getDefaultLocale(country),
+      ipAddress: detectedLocale.ip || req.ip,
+      country: detectedLocale.country,
+      currency: detectedLocale.currency,
+      locale: detectedLocale.locale,
+      preferredLanguage: detectedLocale.locale,
       accountExpiresAt: new Date(Date.now() + VALIDITY_DAYS * 24 * 60 * 60 * 1000),
     });
 
-    // Create role-specific profile
-    if (role === 'provider') {
-      await ProviderProfile.create({
-        user: user._id,
-        city: '',
-        profileExpiresAt: new Date(Date.now() + VALIDITY_DAYS * 24 * 60 * 60 * 1000),
-      });
-    } else {
-      await RecruiterProfile.create({
-        user: user._id,
-        freeViewResetAt: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),
-        profileExpiresAt: new Date(Date.now() + VALIDITY_DAYS * 24 * 60 * 60 * 1000),
-      });
+    if (user.activeRole) {
+      await ensureRoleProfile(user._id, user.activeRole);
+      await ensureRoleSubscription(user, user.activeRole, { startDate: user.createdAt });
     }
 
-    // Auto-assign default provider plan or free recruiter plan
-    if (role === 'provider') {
-      await ensureDefaultProviderSubscription(user._id, { startDate: user.createdAt });
-    } else {
-      await assignFreePlan(user._id, role);
-    }
-
-    const token = generateToken(user._id, user.role);
+    await issueEmailOtp(user.email);
 
     res.status(201).json({
-      _id: user._id,
-      name: user.name,
+      message: 'OTP sent to your email. Please verify to complete registration.',
+      requiresEmailVerification: true,
       email: user.email,
-      role: user.role,
-      token,
+      roles: user.roles || [],
+      activeRole: user.activeRole || null,
       isNewUser: true,
     });
   } catch (error) {
     console.error(error);
+    res.status(500).json({ message: 'Server error', error: error.message });
+  }
+};
+
+// @desc    Send (or resend) registration email OTP
+// @route   POST /api/auth/register/send-otp
+const sendRegistrationEmailOtp = async (req, res) => {
+  try {
+    const normalizedEmail = (req.body.email || '').trim().toLowerCase();
+    if (!normalizedEmail) return res.status(400).json({ message: 'Email is required' });
+
+    const user = await User.findOne({ email: normalizedEmail });
+    if (!user || user.authProvider !== 'email') {
+      return res.status(404).json({ message: 'No email account found for this address' });
+    }
+    if (user.isBlocked) {
+      return res.status(403).json({ message: 'Account blocked. Contact admin.' });
+    }
+    if (user.isEmailVerified) {
+      return res.status(400).json({ message: 'Email is already verified. Please login.' });
+    }
+
+    await issueEmailOtp(user.email);
+    res.json({ message: 'Verification OTP sent to email' });
+  } catch (error) {
+    res.status(500).json({ message: 'Server error', error: error.message });
+  }
+};
+
+// @desc    Confirm registration email OTP and activate account
+// @route   POST /api/auth/register/verify-otp
+const confirmRegistrationEmailOtp = async (req, res) => {
+  try {
+    const { email, otp, whatsappNumber } = req.body;
+    const normalizedEmail = (email || '').trim().toLowerCase();
+
+    if (!normalizedEmail || !otp) {
+      return res.status(400).json({ message: 'Email and OTP are required' });
+    }
+
+    const user = await User.findOne({ email: normalizedEmail }).select('+role');
+    if (!user || user.authProvider !== 'email') {
+      return res.status(404).json({ message: 'No email account found for this address' });
+    }
+    if (user.isBlocked) {
+      return res.status(403).json({ message: 'Account blocked. Contact admin.' });
+    }
+
+    const record = await Otp.findOne({
+      identifier: normalizedEmail,
+      otp,
+      isUsed: false,
+      type: 'email',
+      expiresAt: { $gt: new Date() },
+    }).sort({ createdAt: -1 });
+
+    if (!record) return res.status(400).json({ message: 'Invalid or expired OTP' });
+
+    record.isUsed = true;
+    await record.save();
+
+    const normalized = normalizeRoles(user);
+    user.roles = normalized.roles;
+    user.activeRole = normalized.activeRole;
+    user.isEmailVerified = true;
+    user.lastLogin = new Date();
+    user.ipAddress = req.ip;
+    if (whatsappNumber) {
+      user.whatsappNumber = whatsappNumber;
+      user.whatsappConsent = true;
+    }
+    await user.save();
+
+    if (user.activeRole) {
+      await ensureRoleProfile(user._id, user.activeRole);
+      await ensureRoleSubscription(user, user.activeRole);
+    }
+
+    res.json(buildAuthPayload(user, { isNewUser: true }));
+  } catch (error) {
     res.status(500).json({ message: 'Server error', error: error.message });
   }
 };
@@ -102,8 +301,9 @@ const registerEmail = async (req, res) => {
 const loginUser = async (req, res) => {
   try {
     const { email, password } = req.body;
+    const normalizedEmail = (email || '').trim().toLowerCase();
 
-    const user = await User.findOne({ email });
+    const user = await User.findOne({ email: normalizedEmail }).select('+role');
     if (!user) {
       return res.status(401).json({ message: 'Invalid email or password' });
     }
@@ -111,30 +311,57 @@ const loginUser = async (req, res) => {
       return res.status(403).json({ message: 'Account blocked. Contact admin.' });
     }
 
+    if (user.authProvider !== 'email') {
+      return res.status(400).json({
+        message:
+          user.authProvider === 'google'
+            ? 'This account uses Google sign-in. Please continue with Google.'
+            : 'This account uses WhatsApp sign-in. Please continue with WhatsApp OTP.',
+      });
+    }
+
     const isMatch = await user.matchPassword(password);
     if (!isMatch) {
       return res.status(401).json({ message: 'Invalid email or password' });
     }
 
-    user.lastLogin = new Date();
-    user.ipAddress = req.ip;
-    await user.save();
+    if (!user.isEmailVerified) {
+      const hasOtpHistory = await Otp.exists({ identifier: user.email, type: 'email' });
 
-    if (user.role === 'provider') {
-      await ensureDefaultProviderSubscription(user._id);
+      if (hasOtpHistory) {
+        await issueEmailOtp(user.email);
+        return res.status(403).json({
+          message: 'Email not verified. We sent a fresh OTP to your email.',
+          requiresEmailVerification: true,
+          email: user.email,
+        });
+      }
+
+      user.isEmailVerified = true;
     }
 
-    const token = generateToken(user._id, user.role);
+    const normalized = normalizeRoles(user);
+    user.roles = normalized.roles;
+    user.activeRole = normalized.activeRole;
+    user.lastLogin = new Date();
+    user.ipAddress = req.ip;
 
-    res.json({
-      _id: user._id,
-      name: user.name,
-      email: user.email,
-      phone: user.phone,
-      role: user.role,
-      avatar: user.avatar,
-      token,
-    });
+    if (!user.country || !user.currency || !user.locale) {
+      const detectedLocale = await detectLocaleFromRequest(req);
+      user.country = user.country || detectedLocale.country;
+      user.currency = user.currency || detectedLocale.currency;
+      user.locale = user.locale || detectedLocale.locale;
+      user.preferredLanguage = user.preferredLanguage || user.locale;
+    }
+
+    await user.save();
+
+    if (user.activeRole) {
+      await ensureRoleProfile(user._id, user.activeRole);
+      await ensureRoleSubscription(user, user.activeRole);
+    }
+
+    res.json(buildAuthPayload(user));
   } catch (error) {
     res.status(500).json({ message: 'Server error', error: error.message });
   }
@@ -144,13 +371,13 @@ const loginUser = async (req, res) => {
 // @route   POST /api/auth/google
 const googleAuth = async (req, res) => {
   try {
-    const { accessToken, role } = req.body;
+    const { accessToken } = req.body;
+    const { roles: requestedRoles, activeRole: requestedActiveRole } = parseRoleSelection(req.body);
 
     if (!accessToken) {
       return res.status(400).json({ message: 'Google access token required' });
     }
 
-    // Verify the access token by calling Google's userinfo endpoint
     const googleRes = await fetch(
       `https://www.googleapis.com/oauth2/v3/userinfo?access_token=${encodeURIComponent(accessToken)}`
     );
@@ -165,101 +392,61 @@ const googleAuth = async (req, res) => {
     if (!email || !googleId) {
       return res.status(400).json({ message: 'Could not retrieve Google account info' });
     }
-
     if (!email_verified) {
       return res.status(400).json({ message: 'Google account email is not verified' });
     }
 
-    let user = await User.findOne({ email });
-
+    let user = await User.findOne({ email }).select('+role');
     let isNewUser = false;
+
     if (user) {
-      // Existing user - login with their existing role
       if (user.isBlocked) {
         return res.status(403).json({ message: 'Account blocked' });
       }
-      // If user provides a different role than registered, inform them
-      if (role && role !== user.role) {
-        return res.status(400).json({
-          message: `This email is already registered as a ${user.role}. Logging you in with your existing role.`,
-          existingRole: user.role,
-        });
-      }
+
+      const normalized = normalizeRoles(user);
+      const nextRoles = [...new Set([...normalized.roles, ...requestedRoles])];
+
       user.lastLogin = new Date();
       user.googleId = googleId;
       if (avatar) user.avatar = avatar;
+      user.roles = nextRoles;
+      user.activeRole = requestedActiveRole || normalized.activeRole || nextRoles[0] || null;
       await user.save();
 
-      // Auto-create profile if it somehow doesn't exist
-      if (user.role === 'provider') {
-        const exists = await ProviderProfile.findOne({ user: user._id });
-        if (!exists) {
-          await ProviderProfile.create({ user: user._id, profileExpiresAt: new Date(Date.now() + 365 * 24 * 60 * 60 * 1000) });
-          isNewUser = true;
-        }
-      } else if (user.role === 'recruiter') {
-        const exists = await RecruiterProfile.findOne({ user: user._id });
-        if (!exists) {
-          await RecruiterProfile.create({ user: user._id, freeViewResetAt: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000) });
-          isNewUser = true;
-        }
-      }
-
-      if (user.role === 'provider') {
-        await ensureDefaultProviderSubscription(user._id);
+      if (user.activeRole) {
+        await ensureRoleProfile(user._id, user.activeRole);
+        await ensureRoleSubscription(user, user.activeRole);
       }
     } else {
-      // New user - signup
-      if (!role) {
-        return res.status(400).json({ message: 'Role is required for new signup' });
-      }
-      if (!['provider', 'recruiter'].includes(role)) {
-        return res.status(400).json({ message: 'Invalid role' });
-      }
+      const detectedLocale = await detectLocaleFromRequest(req);
       user = await User.create({
         name,
         email,
         googleId,
         avatar: avatar || '',
-        role,
+        roles: requestedRoles,
+        activeRole: requestedActiveRole,
+        role: requestedActiveRole || null,
         authProvider: 'google',
         isEmailVerified: true,
         termsAccepted: true,
-        ipAddress: req.ip,
+        ipAddress: detectedLocale.ip || req.ip,
+        country: detectedLocale.country,
+        currency: detectedLocale.currency,
+        locale: detectedLocale.locale,
+        preferredLanguage: detectedLocale.locale,
       });
 
-      if (role === 'provider') {
-        await ProviderProfile.create({
-          user: user._id,
-          profileExpiresAt: new Date(Date.now() + 365 * 24 * 60 * 60 * 1000),
-        });
-      } else if (role === 'recruiter') {
-        await RecruiterProfile.create({
-          user: user._id,
-          freeViewResetAt: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),
-        });
+      if (user.activeRole) {
+        await ensureRoleProfile(user._id, user.activeRole);
+        await ensureRoleSubscription(user, user.activeRole, { startDate: user.createdAt });
       }
-      isNewUser = true;
 
-      // Auto-assign default provider plan or free recruiter plan
-      if (role === 'provider') {
-        await ensureDefaultProviderSubscription(user._id, { startDate: user.createdAt });
-      } else {
-        await assignFreePlan(user._id, role);
-      }
+      isNewUser = true;
     }
 
-    const token = generateToken(user._id, user.role);
-
-    res.json({
-      _id: user._id,
-      name: user.name,
-      email: user.email,
-      role: user.role,
-      avatar: user.avatar,
-      token,
-      isNewUser,
-    });
+    res.json(buildAuthPayload(user, { isNewUser }));
   } catch (error) {
     res.status(500).json({ message: 'Server error', error: error.message });
   }
@@ -277,7 +464,7 @@ const whatsappSendOtp = async (req, res) => {
       identifier: phone,
       otp,
       type: 'phone',
-      expiresAt: new Date(Date.now() + 10 * 60 * 1000), // 10 min
+      expiresAt: new Date(Date.now() + 10 * 60 * 1000),
     });
 
     await sendPhoneOTP(phone, otp);
@@ -291,7 +478,8 @@ const whatsappSendOtp = async (req, res) => {
 // @route   POST /api/auth/whatsapp/verify-otp
 const whatsappVerifyOtp = async (req, res) => {
   try {
-    const { phone, otp, name, role } = req.body;
+    const { phone, otp, name } = req.body;
+    const { roles: requestedRoles, activeRole: requestedActiveRole } = parseRoleSelection(req.body);
     if (!phone || !otp) return res.status(400).json({ message: 'Phone and OTP required' });
 
     const otpRecord = await Otp.findOne({
@@ -308,83 +496,57 @@ const whatsappVerifyOtp = async (req, res) => {
     otpRecord.isUsed = true;
     await otpRecord.save();
 
-    let user = await User.findOne({ phone });
+    let user = await User.findOne({ phone }).select('+role');
     let isNewUser = false;
 
     if (user) {
-      // Existing user
+      const normalized = normalizeRoles(user);
+      const nextRoles = [...new Set([...normalized.roles, ...requestedRoles])];
+
+      user.roles = nextRoles;
+      user.activeRole = requestedActiveRole || normalized.activeRole || nextRoles[0] || null;
       user.isPhoneVerified = true;
       user.lastLogin = new Date();
       await user.save();
 
-      // Auto-create profile if missing
-      if (user.role === 'provider') {
-        const exists = await ProviderProfile.findOne({ user: user._id });
-        if (!exists) {
-          await ProviderProfile.create({ user: user._id, profileExpiresAt: new Date(Date.now() + 365 * 24 * 60 * 60 * 1000) });
-          isNewUser = true;
-        }
-      } else if (user.role === 'recruiter') {
-        const exists = await RecruiterProfile.findOne({ user: user._id });
-        if (!exists) {
-          await RecruiterProfile.create({ user: user._id, freeViewResetAt: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000) });
-          isNewUser = true;
-        }
-      }
-
-      if (user.role === 'provider') {
-        await ensureDefaultProviderSubscription(user._id);
+      if (user.activeRole) {
+        await ensureRoleProfile(user._id, user.activeRole);
+        await ensureRoleSubscription(user, user.activeRole);
       }
     } else {
-      // New user
-      if (!name || !role) {
-        return res.status(400).json({ message: 'Name and role required for new user', needsRegistration: true, phoneVerified: true });
+      if (!name) {
+        return res.status(400).json({ message: 'Name required for new user', needsRegistration: true, phoneVerified: true });
       }
+
+      const detectedLocale = await detectLocaleFromRequest(req);
       user = await User.create({
         name,
         email: `${phone}@whatsapp.servicehub.com`,
         phone,
-        role,
+        roles: requestedRoles,
+        activeRole: requestedActiveRole,
+        role: requestedActiveRole || null,
         authProvider: 'whatsapp',
         isPhoneVerified: true,
         whatsappConsent: true,
         termsAccepted: true,
-        ipAddress: req.ip,
+        ipAddress: detectedLocale.ip || req.ip,
+        country: detectedLocale.country,
+        currency: detectedLocale.currency,
+        locale: detectedLocale.locale,
+        preferredLanguage: detectedLocale.locale,
       });
 
-      if (role === 'provider') {
-        await ProviderProfile.create({
-          user: user._id,
-          profileExpiresAt: new Date(Date.now() + 365 * 24 * 60 * 60 * 1000),
-        });
-      } else if (role === 'recruiter') {
-        await RecruiterProfile.create({
-          user: user._id,
-          freeViewResetAt: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),
-        });
+      if (user.activeRole) {
+        await ensureRoleProfile(user._id, user.activeRole);
+        await ensureRoleSubscription(user, user.activeRole, { startDate: user.createdAt });
       }
+
       isNewUser = true;
       await sendWhatsAppMessage(phone, 'welcome', { name: user.name });
-
-      // Auto-assign default provider plan or free recruiter plan
-      if (role === 'provider') {
-        await ensureDefaultProviderSubscription(user._id, { startDate: user.createdAt });
-      } else {
-        await assignFreePlan(user._id, role);
-      }
     }
 
-    const token = generateToken(user._id, user.role);
-
-    res.json({
-      _id: user._id,
-      name: user.name,
-      email: user.email,
-      phone: user.phone,
-      role: user.role,
-      token,
-      isNewUser,
-    });
+    res.json(buildAuthPayload(user, { isNewUser }));
   } catch (error) {
     res.status(500).json({ message: 'Server error', error: error.message });
   }
@@ -439,16 +601,61 @@ const confirmEmailVerification = async (req, res) => {
 // @route   GET /api/auth/me
 const getMe = async (req, res) => {
   try {
-    const user = await User.findById(req.user._id).select('-password');
-    let profile = null;
+    const user = await User.findById(req.user._id).select('-password +role');
+    const normalized = normalizeRoles(user);
+    user.roles = normalized.roles;
+    user.activeRole = normalized.activeRole;
 
-    if (user.role === 'provider') {
-      profile = await ProviderProfile.findOne({ user: user._id });
-    } else if (user.role === 'recruiter') {
-      profile = await RecruiterProfile.findOne({ user: user._id });
+    const profile = user.activeRole ? await getProfileByRole(user._id, user.activeRole) : null;
+
+    res.json({
+      user: {
+        ...user.toObject(),
+        role: user.activeRole,
+      },
+      profile,
+    });
+  } catch (error) {
+    res.status(500).json({ message: 'Server error', error: error.message });
+  }
+};
+
+// @desc    Switch active role
+// @route   POST /api/auth/switch-role
+const switchRole = async (req, res) => {
+  try {
+    const role = req.body.role || req.body.panel;
+    if (!VALID_ROLES.includes(role)) {
+      return res.status(400).json({ message: 'Invalid role/panel. Allowed values: provider, recruiter.' });
     }
 
-    res.json({ user, profile });
+    const user = await User.findById(req.user._id).select('-password +role');
+    if (!user) return res.status(404).json({ message: 'User not found' });
+
+    const normalized = normalizeRoles(user);
+    const nextRoles = [...new Set([...normalized.roles, role])];
+
+    user.roles = nextRoles;
+    user.activeRole = role;
+    await user.save();
+
+    await ensureRoleProfile(user._id, role);
+    await ensureRoleSubscription(user, role);
+
+    const profile = await getProfileByRole(user._id, role);
+
+    res.json({
+      user: {
+        ...user.toObject(),
+        role: role,
+      },
+      roles: user.roles,
+      activeRole: role,
+      panel: role,
+      redirectPath: `/${role}/dashboard`,
+      profile,
+      token: generateToken(user._id, role),
+    });
   } catch (error) {
     res.status(500).json({ message: 'Server error', error: error.message });
   }
@@ -480,12 +687,16 @@ const updateLocale = async (req, res) => {
     const user = await User.findById(req.user._id);
     const nextLanguage = locale || language;
 
-    if (nextLanguage && SUPPORTED_LOCALES.has(nextLanguage)) {
-      user.locale = nextLanguage;
-      user.preferredLanguage = nextLanguage;
+    const nextLocaleCode = normalizeLanguageCode(nextLanguage);
+    const nextCountryCode = normalizeCountryCode(country);
+    const nextCurrencyCode = normalizeCurrencyCode(currency);
+
+    if (nextLocaleCode && SUPPORTED_LOCALES.has(nextLocaleCode)) {
+      user.locale = nextLocaleCode;
+      user.preferredLanguage = nextLocaleCode;
     }
-    if (country && ['IN', 'AE'].includes(country)) user.country = country;
-    if (currency && ['INR', 'AED', 'USD'].includes(currency)) user.currency = currency;
+    if (nextCountryCode) user.country = nextCountryCode;
+    if (nextCurrencyCode) user.currency = nextCurrencyCode;
     await user.save();
 
     res.json({
@@ -524,14 +735,14 @@ const updateLanguagePreference = async (req, res) => {
 const toggleWhatsappAlerts = async (req, res) => {
   try {
     const { enabled } = req.body;
-    const user = await User.findById(req.user._id);
+    const user = await User.findById(req.user._id).select('+role');
     user.whatsappAlerts = enabled !== false;
     await user.save();
 
-    // Also update profile-level alerts
-    if (user.role === 'provider') {
+    const activeRole = user.activeRole || user.role;
+    if (activeRole === 'provider') {
       await ProviderProfile.findOneAndUpdate({ user: user._id }, { whatsappAlerts: user.whatsappAlerts });
-    } else if (user.role === 'recruiter') {
+    } else if (activeRole === 'recruiter') {
       await RecruiterProfile.findOneAndUpdate({ user: user._id }, { whatsappAlerts: user.whatsappAlerts });
     }
 
@@ -543,6 +754,8 @@ const toggleWhatsappAlerts = async (req, res) => {
 
 module.exports = {
   registerEmail,
+  sendRegistrationEmailOtp,
+  confirmRegistrationEmailOtp,
   loginUser,
   googleAuth,
   whatsappSendOtp,
@@ -550,6 +763,7 @@ module.exports = {
   sendEmailVerification,
   confirmEmailVerification,
   getMe,
+  switchRole,
   updateWhatsappNumber,
   updateLocale,
   updateLanguagePreference,

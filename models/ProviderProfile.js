@@ -7,6 +7,10 @@ const providerProfileSchema = new mongoose.Schema({
   experience: { type: String, default: '' },
   city: { type: String, default: '', trim: true },
   state: { type: String, default: '', trim: true },
+  nearestLocation: { type: String, default: '', trim: true },
+  latitude: { type: Number, default: null },
+  longitude: { type: Number, default: null },
+  locationUpdatedAt: { type: Date, default: null },
   languages: [{ type: String }],
   description: { type: String, default: '' },
   portfolioLinks: [{ type: String }],
@@ -20,8 +24,12 @@ const providerProfileSchema = new mongoose.Schema({
   isApproved: { type: Boolean, default: false },
 
   // Plan & boost
-  currentPlan: { type: String, enum: ['free', 'basic', 'pro', 'featured'], default: 'free' },
+  currentPlan: { type: String, enum: ['free', 'starter', 'business', 'enterprise', 'basic', 'pro', 'featured'], default: 'free' },
   planExpiresAt: { type: Date },
+  subscriptionPlan: { type: String, enum: ['free', 'enterprise'], default: 'free' },
+  subscriptionStartDate: { type: Date, default: null },
+  subscriptionEndDate: { type: Date, default: null },
+  isActiveSubscription: { type: Boolean, default: false },
   isTopCity: { type: Boolean, default: false },
   boostWeight: { type: Number, default: 0 },
 
@@ -46,5 +54,6 @@ providerProfileSchema.index({ skills: 1, city: 1 });
 providerProfileSchema.index({ city: 1 });
 providerProfileSchema.index({ tier: 1 });
 providerProfileSchema.index({ boostWeight: -1 });
+providerProfileSchema.index({ latitude: 1, longitude: 1 });
 
 module.exports = mongoose.model('ProviderProfile', providerProfileSchema);

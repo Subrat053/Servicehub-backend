@@ -4,14 +4,23 @@ const User = require('../models/User');
 const Payment = require('../models/Payment');
 const AdminSetting = require('../models/AdminSetting');
 const ProviderProfile = require('../models/ProviderProfile');
+const RecruiterProfile = require('../models/RecruiterProfile');
 const { updateUserBadge } = require('../services/badgeService');
+
+const getEffectiveRole = (user) => user.activeRole || (Array.isArray(user.roles) ? user.roles[0] : null) || user.role;
 
 // @desc    Get my active subscription
 // @route   GET /api/subscriptions/me
 const getMySubscription = async (req, res) => {
   try {
+    const activeRole = getEffectiveRole(req.user);
+    if (!activeRole || activeRole === 'admin') {
+      return res.json({ subscription: null, message: 'No role-scoped subscription for current role' });
+    }
+
     const subscription = await UserSubscription.findOne({
       userId: req.user._id,
+      role: activeRole,
       status: 'active',
       endDate: { $gt: new Date() },
     }).populate('planId');
@@ -29,12 +38,13 @@ const getMySubscription = async (req, res) => {
 // @route   POST /api/subscriptions/activate
 const activateSubscription = async (req, res) => {
   try {
-    const { userId, planId } = req.body;
+    const { userId, planId, role } = req.body;
 
     const plan = await Plan.findById(planId);
     if (!plan) return res.status(404).json({ message: 'Plan not found' });
 
-    const subscription = await assignPlanToUser(userId, plan);
+    const roleForPlan = role || plan.type;
+    const subscription = await assignPlanToUser(userId, roleForPlan, plan);
     res.json({ message: 'Subscription activated', subscription });
   } catch (error) {
     res.status(500).json({ message: 'Server error', error: error.message });
@@ -50,7 +60,7 @@ const getAllSubscriptions = async (req, res) => {
     if (status) filter.status = status;
 
     const subscriptions = await UserSubscription.find(filter)
-      .populate('userId', 'name email role')
+      .populate('userId', 'name email roles activeRole')
       .populate('planId', 'name price type')
       .sort({ createdAt: -1 })
       .skip((parseInt(page) - 1) * parseInt(limit))
@@ -100,17 +110,18 @@ const getRevenue = async (req, res) => {
  * Expires any existing active subscription, then creates a new one.
  * Also updates the user's badge.
  */
-async function assignPlanToUser(userId, plan, options = {}) {
+async function assignPlanToUser(userId, role, plan, options = {}) {
   const isDefault = options.isDefault === true;
 
-  // Expire any existing active subscription
+  // Expire existing active subscriptions for this role only.
   await UserSubscription.updateMany(
-    { userId, status: 'active' },
+    { userId, role, status: 'active' },
     { status: 'expired' }
   );
 
   const subscription = await UserSubscription.create({
     userId,
+    role,
     planId: plan._id,
     startDate: new Date(),
     endDate: new Date(Date.now() + plan.duration * 24 * 60 * 60 * 1000),
@@ -141,7 +152,33 @@ async function assignFreePlan(userId, role) {
     return null;
   }
 
-  return assignPlanToUser(userId, freePlan, { isDefault: false });
+  const subscription = await assignPlanToUser(userId, planType, freePlan, { isDefault: false });
+
+  if (planType === 'provider') {
+    await ProviderProfile.findOneAndUpdate(
+      { user: userId },
+      {
+        currentPlan: 'free',
+        boostWeight: 0,
+        isTopCity: false,
+        inRotationPool: false,
+      }
+    );
+  } else {
+    const now = new Date();
+    const resetAt = new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000);
+    await RecruiterProfile.findOneAndUpdate(
+      { user: userId },
+      {
+        currentPlan: 'free',
+        unlocksRemaining: 2,
+        unlockPackSize: 2,
+        freeUnlockResetAt: resetAt,
+      }
+    );
+  }
+
+  return subscription;
 }
 
 async function getDefaultProviderSubscriptionConfig() {
@@ -185,42 +222,8 @@ async function findDefaultProviderPlan(planSlug, durationDays) {
  * Returns existing or newly created subscription, or null if disabled.
  */
 async function ensureDefaultProviderSubscription(userId, options = {}) {
-  const { enabled, planSlug, durationDays } = await getDefaultProviderSubscriptionConfig();
-  if (!enabled) return null;
-
-  const existing = await UserSubscription.findOne({ userId }).sort({ createdAt: -1 });
-  if (existing) return existing;
-
-  const plan = await findDefaultProviderPlan(planSlug, durationDays);
-  if (!plan) return null;
-
-  const startDate = options.startDate ? new Date(options.startDate) : new Date();
-  const planDays = durationDays || plan.duration || 30;
-  const endDate = new Date(startDate.getTime() + planDays * 24 * 60 * 60 * 1000);
-
-  const subscription = await UserSubscription.create({
-    userId,
-    planId: plan._id,
-    startDate,
-    endDate,
-    status: 'active',
-    isDefault: true,
-  });
-
-  await ProviderProfile.findOneAndUpdate(
-    { user: userId },
-    {
-      currentPlan: plan.slug,
-      planExpiresAt: endDate,
-      boostWeight: plan.boostWeight || 0,
-      isTopCity: plan.isRotationEligible === true,
-      inRotationPool: plan.isRotationEligible === true,
-    }
-  );
-
-  await updateUserBadge(userId);
-
-  return subscription;
+  // Deprecated: all newly registered users should start on free plan.
+  return assignFreePlan(userId, 'provider');
 }
 
 module.exports = {

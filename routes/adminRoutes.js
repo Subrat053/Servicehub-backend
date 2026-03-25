@@ -6,7 +6,9 @@ const {
   getUserDetail,
   toggleBlockUser,
   approveProvider,
+  approveRecruiter,
   getProviders,
+  getRecruiters,
   getAllPlans,
   createPlan,
   updatePlan,
@@ -21,6 +23,7 @@ const {
   updateContent,
   deleteUser,
   deleteProvider,
+  deleteRecruiter,
   getPaymentSettings,
   updatePaymentSettings,
   getCurrencySettings,
@@ -58,6 +61,9 @@ router.delete('/users/:id', deleteUser);
 router.put('/providers/:id/approve', approveProvider);
 router.delete('/providers/:id', deleteProvider);
 router.get('/providers', getProviders);
+router.put('/recruiters/:id/approve', approveRecruiter);
+router.delete('/recruiters/:id', deleteRecruiter);
+router.get('/recruiters', getRecruiters);
 router.get('/plans', getAllPlans);
 router.post('/plans', createPlan);
 router.put('/plans/:id', updatePlan);

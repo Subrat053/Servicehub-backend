@@ -2,7 +2,7 @@ const mongoose = require('mongoose');
 
 const planSchema = new mongoose.Schema({
   name: { type: String, required: true, trim: true },
-  slug: { type: String, required: true, unique: true },
+  slug: { type: String, required: true },
   type: { type: String, enum: ['provider', 'recruiter'], required: true },
   price: { type: Number, required: true },
   currency: { type: String, default: 'INR' },
@@ -26,5 +26,7 @@ const planSchema = new mongoose.Schema({
   priorityListing: { type: Boolean, default: false },
   status: { type: String, enum: ['active', 'inactive', 'archived'], default: 'active' },
 }, { timestamps: true });
+
+planSchema.index({ type: 1, slug: 1, duration: 1 }, { unique: true });
 
 module.exports = mongoose.model('Plan', planSchema);

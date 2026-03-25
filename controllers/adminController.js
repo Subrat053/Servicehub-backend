@@ -16,6 +16,94 @@ const { uploadToCloudinary, deleteFromCloudinary } = require('../utils/cloudinar
 const path = require('path');
 const fs = require('fs');
 
+const PLAN_TIERS = new Set(['starter', 'business', 'enterprise']);
+const LEGACY_PAID_TIERS = new Set(['basic', 'pro', 'featured']);
+const PLAN_DURATIONS = [30, 90, 180, 365];
+const DEFAULT_DISCOUNTS = { 90: 5, 180: 10, 365: 20 };
+
+const roundMoney = (value) => Math.max(0, Math.round((Number(value) || 0) * 100) / 100);
+
+const getPlanDiscounts = async () => {
+  const keys = ['plan_discount_90', 'plan_discount_180', 'plan_discount_365'];
+  const settings = await AdminSetting.find({ key: { $in: keys } }).lean();
+  const byKey = new Map(settings.map((s) => [s.key, Number(s.value)]));
+
+  return {
+    90: Number.isFinite(byKey.get('plan_discount_90')) ? byKey.get('plan_discount_90') : DEFAULT_DISCOUNTS[90],
+    180: Number.isFinite(byKey.get('plan_discount_180')) ? byKey.get('plan_discount_180') : DEFAULT_DISCOUNTS[180],
+    365: Number.isFinite(byKey.get('plan_discount_365')) ? byKey.get('plan_discount_365') : DEFAULT_DISCOUNTS[365],
+  };
+};
+
+const derivePriceFromMonthly = (monthlyPrice, duration, discountPercent) => {
+  if (duration === 30) return roundMoney(monthlyPrice);
+  const months = duration / 30;
+  const discountedMultiplier = Math.max(0, 1 - (Number(discountPercent) || 0) / 100);
+  return roundMoney(Number(monthlyPrice || 0) * months * discountedMultiplier);
+};
+
+const syncTierPlanFamily = async ({ payload, currentPlan }) => {
+  const type = payload.type || currentPlan?.type;
+  const slug = payload.slug || currentPlan?.slug;
+
+  if (!type || !slug) {
+    throw new Error('type and slug are required');
+  }
+
+  const isPaidTier = PLAN_TIERS.has(slug) && Number(payload.price) > 0;
+  if (!isPaidTier) return null;
+
+  const discounts = await getPlanDiscounts();
+
+  let monthlyPrice;
+  if (Number(payload.duration) === 30) {
+    monthlyPrice = Number(payload.price);
+  } else {
+    const existingMonthly = await Plan.findOne({ type, slug, duration: 30 });
+    if (existingMonthly) {
+      monthlyPrice = Number(existingMonthly.price);
+    } else {
+      const currentDuration = Number(payload.duration) || 30;
+      const discount = currentDuration === 30 ? 0 : (discounts[currentDuration] || 0);
+      const multiplier = (currentDuration / 30) * (1 - discount / 100);
+      monthlyPrice = multiplier > 0 ? Number(payload.price) / multiplier : Number(payload.price);
+    }
+  }
+
+  const base = {
+    ...payload,
+    type,
+    slug,
+    name: payload.name || currentPlan?.name || slug,
+    sortOrder: payload.sortOrder ?? currentPlan?.sortOrder ?? (slug === 'starter' ? 1 : slug === 'business' ? 2 : 3),
+  };
+
+  const upserts = [];
+  for (const duration of PLAN_DURATIONS) {
+    const discount = duration === 30 ? 0 : (discounts[duration] || 0);
+    const price = derivePriceFromMonthly(monthlyPrice, duration, discount);
+
+    const doc = await Plan.findOneAndUpdate(
+      { type, slug, duration },
+      {
+        ...base,
+        duration,
+        price,
+        isActive: base.isActive !== false,
+      },
+      {
+        new: true,
+        upsert: true,
+        setDefaultsOnInsert: true,
+        runValidators: true,
+      }
+    );
+    upserts.push(doc);
+  }
+
+  return upserts;
+};
+
 // @desc    Admin dashboard stats
 // @route   GET /api/admin/dashboard
 const getDashboard = async (req, res) => {
@@ -24,6 +112,7 @@ const getDashboard = async (req, res) => {
       totalUsers,
       totalProviders,
       totalRecruiters,
+      pendingRecruiterApprovals,
       totalJobs,
       totalLeads,
       totalPayments,
@@ -35,6 +124,7 @@ const getDashboard = async (req, res) => {
       User.countDocuments(),
       User.countDocuments({ role: 'provider' }),
       User.countDocuments({ role: 'recruiter' }),
+      RecruiterProfile.countDocuments({ isApproved: false }),
       JobPost.countDocuments(),
       Lead.countDocuments(),
       Payment.countDocuments({ status: 'completed' }),
@@ -55,6 +145,7 @@ const getDashboard = async (req, res) => {
         totalUsers,
         totalProviders,
         totalRecruiters,
+        pendingRecruiterApprovals,
         totalJobs,
         totalLeads,
         totalPayments,
@@ -127,6 +218,22 @@ const approveProvider = async (req, res) => {
   }
 };
 
+// @desc    Approve/reject recruiter
+// @route   PUT /api/admin/recruiters/:id/approve
+const approveRecruiter = async (req, res) => {
+  try {
+    const { approved } = req.body;
+    const profile = await RecruiterProfile.findById(req.params.id);
+    if (!profile) return res.status(404).json({ message: 'Recruiter not found' });
+    profile.isApproved = approved !== false;
+    profile.isVerified = approved !== false;
+    await profile.save();
+    res.json({ message: `Recruiter ${profile.isApproved ? 'approved' : 'rejected'}`, profile });
+  } catch (error) {
+    res.status(500).json({ message: 'Server error', error: error.message });
+  }
+};
+
 // @desc    Get all providers (admin view)
 // @route   GET /api/admin/providers
 const getProviders = async (req, res) => {
@@ -157,11 +264,42 @@ const getProviders = async (req, res) => {
   }
 };
 
+// @desc    Get all recruiters (admin view)
+// @route   GET /api/admin/recruiters
+const getRecruiters = async (req, res) => {
+  try {
+    const { page = 1, limit = 20, approved, search } = req.query;
+    const filter = {};
+    if (approved === 'true') filter.isApproved = true;
+    if (approved === 'false') filter.isApproved = false;
+    if (search) {
+      filter.$or = [
+        { companyName: { $regex: search, $options: 'i' } },
+        { companyType: { $regex: search, $options: 'i' } },
+        { city: { $regex: search, $options: 'i' } },
+        { state: { $regex: search, $options: 'i' } },
+        { description: { $regex: search, $options: 'i' } },
+      ];
+    }
+
+    const recruiters = await RecruiterProfile.find(filter)
+      .populate('user', 'name email phone')
+      .sort({ createdAt: -1 })
+      .skip((parseInt(page) - 1) * parseInt(limit))
+      .limit(parseInt(limit));
+
+    const total = await RecruiterProfile.countDocuments(filter);
+    res.json({ recruiters, pagination: { page: parseInt(page), limit: parseInt(limit), total, pages: Math.ceil(total / parseInt(limit)) } });
+  } catch (error) {
+    res.status(500).json({ message: 'Server error', error: error.message });
+  }
+};
+
 // @desc    CRUD Plans
 // @route   GET /api/admin/plans
 const getAllPlans = async (req, res) => {
   try {
-    const plans = await Plan.find().sort({ type: 1, sortOrder: 1 });
+    const plans = await Plan.find().sort({ type: 1, duration: 1, sortOrder: 1 });
     res.json(plans);
   } catch (error) {
     res.status(500).json({ message: 'Server error', error: error.message });
@@ -171,7 +309,34 @@ const getAllPlans = async (req, res) => {
 // @route   POST /api/admin/plans
 const createPlan = async (req, res) => {
   try {
-    const plan = await Plan.create(req.body);
+    const payload = req.body || {};
+    const slug = String(payload.slug || '').toLowerCase();
+    const isPaidTier = PLAN_TIERS.has(slug) || LEGACY_PAID_TIERS.has(slug);
+
+    if (isPaidTier && Number(payload.price) <= 0) {
+      return res.status(400).json({ message: 'Paid plan price must be greater than 0' });
+    }
+
+    if (slug === 'free' && payload.type === 'provider') {
+      payload.price = 0;
+      payload.jobApplyLimit = 2;
+      payload.sortOrder = 0;
+    }
+    if (slug === 'free' && payload.type === 'recruiter') {
+      payload.price = 0;
+      payload.unlockCredits = 2;
+      payload.sortOrder = 0;
+    }
+
+    if (PLAN_TIERS.has(slug) && Number(payload.price) > 0) {
+      const family = await syncTierPlanFamily({ payload });
+      return res.status(201).json({
+        message: 'Plan family synced from monthly price with discounts',
+        plans: family,
+      });
+    }
+
+    const plan = await Plan.create(payload);
     res.status(201).json(plan);
   } catch (error) {
     res.status(500).json({ message: 'Server error', error: error.message });
@@ -181,7 +346,38 @@ const createPlan = async (req, res) => {
 // @route   PUT /api/admin/plans/:id
 const updatePlan = async (req, res) => {
   try {
-    const plan = await Plan.findByIdAndUpdate(req.params.id, req.body, { new: true });
+    const existing = await Plan.findById(req.params.id);
+    if (!existing) return res.status(404).json({ message: 'Plan not found' });
+
+    const payload = { ...req.body, type: req.body.type || existing.type, slug: req.body.slug || existing.slug };
+    const slug = String(payload.slug || '').toLowerCase();
+    const effectivePrice = Number(payload.price ?? existing.price);
+    const isPaidTier = PLAN_TIERS.has(slug) || LEGACY_PAID_TIERS.has(slug);
+
+    if (isPaidTier && effectivePrice <= 0) {
+      return res.status(400).json({ message: 'Paid plan price must be greater than 0' });
+    }
+
+    if (slug === 'free' && payload.type === 'provider') {
+      payload.price = 0;
+      payload.jobApplyLimit = 2;
+      payload.sortOrder = 0;
+    }
+    if (slug === 'free' && payload.type === 'recruiter') {
+      payload.price = 0;
+      payload.unlockCredits = 2;
+      payload.sortOrder = 0;
+    }
+
+    if (PLAN_TIERS.has(slug) && Number(payload.price || existing.price) > 0) {
+      const family = await syncTierPlanFamily({ payload: { ...existing.toObject(), ...payload }, currentPlan: existing });
+      return res.json({
+        message: 'Plan family synced from monthly price with discounts',
+        plans: family,
+      });
+    }
+
+    const plan = await Plan.findByIdAndUpdate(req.params.id, payload, { new: true, runValidators: true });
     if (!plan) return res.status(404).json({ message: 'Plan not found' });
     res.json(plan);
   } catch (error) {
@@ -408,18 +604,38 @@ const updatePaymentSettings = async (req, res) => {
 // @route   DELETE /api/admin/users/:id
 const deleteUser = async (req, res) => {
   try {
+    if (req.user && req.user._id && req.user._id.toString() === req.params.id.toString()) {
+      return res.status(400).json({ message: 'Admin cannot remove own account' });
+    }
+
     const user = await User.findById(req.params.id);
     if (!user) return res.status(404).json({ message: 'User not found' });
+
+    const userRoles = Array.isArray(user.roles) ? user.roles : [];
+    const effectiveRole = user.activeRole || user.role || userRoles[0];
     
     // Delete associated profiles
-    if (user.role === 'provider') {
+    if (effectiveRole === 'provider') {
       await ProviderProfile.findOneAndDelete({ user: user._id });
       await Lead.deleteMany({ provider: user._id });
-      await Review.deleteMany({ provider: user._id });
-    } else if (user.role === 'recruiter') {
+      await Review.deleteMany({
+        $or: [
+          { provider: user._id },
+          { revieweeId: user._id },
+          { reviewerId: user._id },
+        ],
+      });
+    } else if (effectiveRole === 'recruiter') {
       await RecruiterProfile.findOneAndDelete({ user: user._id });
       await JobPost.deleteMany({ recruiter: user._id });
       await Lead.deleteMany({ recruiter: user._id });
+      await Review.deleteMany({
+        $or: [
+          { recruiter: user._id },
+          { revieweeId: user._id },
+          { reviewerId: user._id },
+        ],
+      });
     }
     
     // Delete user
@@ -439,7 +655,13 @@ const deleteProvider = async (req, res) => {
     
     // Delete associated data
     await Lead.deleteMany({ provider: profile.user });
-    await Review.deleteMany({ provider: profile.user });
+    await Review.deleteMany({
+      $or: [
+        { provider: profile.user },
+        { revieweeId: profile.user },
+        { reviewerId: profile.user },
+      ],
+    });
     await RotationPool.updateMany(
       { providers: profile._id },
       { $pull: { providers: profile._id } }
@@ -452,6 +674,32 @@ const deleteProvider = async (req, res) => {
     await User.findByIdAndDelete(profile.user);
     
     res.json({ message: 'Provider deleted successfully' });
+  } catch (error) {
+    res.status(500).json({ message: 'Server error', error: error.message });
+  }
+};
+
+// @desc    Delete recruiter profile
+// @route   DELETE /api/admin/recruiters/:id
+const deleteRecruiter = async (req, res) => {
+  try {
+    const profile = await RecruiterProfile.findById(req.params.id);
+    if (!profile) return res.status(404).json({ message: 'Recruiter not found' });
+
+    await JobPost.deleteMany({ recruiter: profile.user });
+    await Lead.deleteMany({ recruiter: profile.user });
+    await Review.deleteMany({
+      $or: [
+        { recruiter: profile.user },
+        { revieweeId: profile.user },
+        { reviewerId: profile.user },
+      ],
+    });
+
+    await RecruiterProfile.findByIdAndDelete(req.params.id);
+    await User.findByIdAndDelete(profile.user);
+
+    res.json({ message: 'Recruiter deleted successfully' });
   } catch (error) {
     res.status(500).json({ message: 'Server error', error: error.message });
   }
@@ -743,7 +991,9 @@ module.exports = {
   getUserDetail,
   toggleBlockUser,
   approveProvider,
+  approveRecruiter,
   getProviders,
+  getRecruiters,
   getAllPlans,
   createPlan,
   updatePlan,
@@ -760,6 +1010,7 @@ module.exports = {
   getProfilePhoto,
   deleteUser,
   deleteProvider,
+  deleteRecruiter,
   getPaymentSettings,
   updatePaymentSettings,
   getCurrencySettings,

@@ -16,16 +16,18 @@ function getBadgeText(plan, role) {
  * Update a user's subscriptionBadge based on their active subscription.
  */
 async function updateUserBadge(userId) {
+  const user = await User.findById(userId).select('+role');
+  if (!user) return;
+
+  const role = user.activeRole || user.role || (Array.isArray(user.roles) ? user.roles[0] : null);
   const sub = await UserSubscription.findOne({
     userId,
+    role,
     status: 'active',
     endDate: { $gt: new Date() },
   }).populate('planId');
 
-  const user = await User.findById(userId);
-  if (!user) return;
-
-  const badge = sub ? getBadgeText(sub.planId, user.role) : '';
+  const badge = sub ? getBadgeText(sub.planId, role) : '';
   if (user.subscriptionBadge !== badge) {
     user.subscriptionBadge = badge;
     await user.save();

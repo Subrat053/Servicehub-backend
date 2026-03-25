@@ -5,8 +5,10 @@ const RecruiterProfile = require('../models/RecruiterProfile');
 const UserSubscription = require('../models/UserSubscription');
 const Plan = require('../models/Plan');
 const WhatsappLog = require('../models/WhatsappLog');
+const Notification = require('../models/Notification');
 const { sendWhatsAppMessage, formatPhoneNumber } = require('./messaging');
 const { clearUserBadge } = require('../services/badgeService');
+const { createNotification } = require('../services/notificationService');
 
 /**
  * Check subscription expiry and send renewal reminders
@@ -19,6 +21,7 @@ const startCronJobs = () => {
     try {
       await checkProviderRenewals();
       await checkRecruiterRenewals();
+      await sendPlanExpiryReminders();
       await revertExpiredSubscriptions();
     } catch (err) {
       console.error('[CRON] Renewal check error:', err.message);
@@ -110,6 +113,55 @@ async function checkProviderRenewals() {
   console.log(`[CRON] Provider renewals: ${providers30.length} (30d), ${providers7.length} (7d)`);
 }
 
+async function sendPlanExpiryReminders() {
+  const now = new Date();
+  const maxWindow = new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000);
+
+  const subscriptions = await UserSubscription.find({
+    status: 'active',
+    endDate: { $gt: now, $lte: maxWindow },
+  }).populate('userId', 'name').populate('planId', 'name');
+
+  const milestones = [30, 7, 1];
+  let sent = 0;
+
+  for (const sub of subscriptions) {
+    if (!sub.userId || !sub.planId) continue;
+
+    const daysLeft = Math.ceil((sub.endDate - now) / (24 * 60 * 60 * 1000));
+    const milestone = milestones.find((d) => daysLeft <= d && daysLeft > d - 1);
+    if (!milestone) continue;
+
+    const existing = await Notification.findOne({
+      userId: sub.userId._id,
+      type: 'PLAN_EXPIRY_REMINDER',
+      'data.subscriptionId': sub._id,
+      'data.milestoneDays': milestone,
+    }).lean();
+
+    if (existing) continue;
+
+    await createNotification({
+      userId: sub.userId._id,
+      type: 'PLAN_EXPIRY_REMINDER',
+      title: 'Plan Expiry Reminder',
+      message: `Your ${sub.planId.name} plan expires in ${daysLeft} day${daysLeft > 1 ? 's' : ''}`,
+      data: {
+        subscriptionId: sub._id,
+        planId: sub.planId._id,
+        milestoneDays: milestone,
+        daysLeft,
+        expiresAt: sub.endDate,
+      },
+    });
+    sent += 1;
+  }
+
+  if (sent > 0) {
+    console.log(`[CRON] Sent ${sent} in-app plan expiry reminders`);
+  }
+}
+
 async function checkRecruiterRenewals() {
   const now = new Date();
   const thirtyDaysFromNow = new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000);
@@ -188,7 +240,7 @@ async function revertExpiredSubscriptions() {
   const expiredSubs = await UserSubscription.find({
     status: 'active',
     endDate: { $lt: now },
-  }).populate('userId', 'role');
+  }).populate('userId', 'roles activeRole role');
 
   let reverted = 0;
   for (const sub of expiredSubs) {
@@ -198,12 +250,14 @@ async function revertExpiredSubscriptions() {
     if (!sub.userId) continue;
 
     // Find the free plan for this user's role
-    const planType = sub.userId.role === 'recruiter' ? 'recruiter' : 'provider';
+    const fallbackRole = sub.userId.activeRole || sub.userId.role || (Array.isArray(sub.userId.roles) ? sub.userId.roles[0] : null);
+    const planType = sub.role || (fallbackRole === 'recruiter' ? 'recruiter' : 'provider');
     const freePlan = await Plan.findOne({ type: planType, price: 0, isActive: true }).sort({ sortOrder: 1 });
 
     if (freePlan) {
       await UserSubscription.create({
         userId: sub.userId._id,
+        role: planType,
         planId: freePlan._id,
         startDate: now,
         endDate: new Date(now.getTime() + freePlan.duration * 24 * 60 * 60 * 1000),
@@ -211,16 +265,20 @@ async function revertExpiredSubscriptions() {
       });
 
       // Update profile plan slug to free
-      if (sub.userId.role === 'provider') {
+      if (planType === 'provider') {
         await ProviderProfile.findOneAndUpdate({ user: sub.userId._id }, {
           currentPlan: 'free',
           boostWeight: 0,
           isTopCity: false,
           inRotationPool: false,
         });
-      } else if (sub.userId.role === 'recruiter') {
+      } else if (planType === 'recruiter') {
+        const resetAt = new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000);
         await RecruiterProfile.findOneAndUpdate({ user: sub.userId._id }, {
           currentPlan: 'free',
+          unlocksRemaining: 2,
+          unlockPackSize: 2,
+          freeUnlockResetAt: resetAt,
         });
       }
     }

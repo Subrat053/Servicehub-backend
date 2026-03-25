@@ -11,10 +11,19 @@ const JobPost = require('../models/JobPost');
 const Application = require('../models/Application');
 const { uploadToCloudinary, deleteFromCloudinary } = require('../utils/cloudinary');
 const { sendWhatsAppMessage } = require('../utils/messaging');
+const { createNotification } = require('../services/notificationService');
 const { getActiveSubscription } = require('../middleware/subscription');
-const { assignPlanToUser, ensureDefaultProviderSubscription } = require('./subscriptionController');
+const { assignPlanToUser, assignFreePlan } = require('./subscriptionController');
+const { getCoordinatesFromText, upsertLocationRecord } = require('../services/locationService');
 const path = require('path');
 const fs = require('fs');
+
+const toCoordinate = (value, min, max) => {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return null;
+  if (parsed < min || parsed > max) return null;
+  return parsed;
+};
 
 // @desc    Get provider profile (own)
 // @route   GET /api/provider/profile
@@ -42,7 +51,7 @@ const updateProfile = async (req, res) => {
     const {
       skills, tier, experience, city, state, languages,
       description, portfolioLinks, photo, documents,
-      whatsappAlerts,
+      whatsappAlerts, nearestLocation, latitude, longitude,
     } = req.body;
 
     let profile = await ProviderProfile.findOne({ user: req.user._id });
@@ -65,6 +74,14 @@ const updateProfile = async (req, res) => {
     if (experience !== undefined) profile.experience = experience;
     if (city !== undefined) profile.city = city;
     if (state !== undefined) profile.state = state;
+    if (typeof nearestLocation === 'string') profile.nearestLocation = nearestLocation.trim();
+    const nextLat = toCoordinate(latitude, -90, 90);
+    const nextLng = toCoordinate(longitude, -180, 180);
+    if (nextLat !== null && nextLng !== null) {
+      profile.latitude = nextLat;
+      profile.longitude = nextLng;
+      profile.locationUpdatedAt = new Date();
+    }
     if (languages !== undefined) profile.languages = languages;
     if (description !== undefined) profile.description = description;
     if (portfolioLinks !== undefined) profile.portfolioLinks = portfolioLinks;
@@ -94,6 +111,32 @@ const updateProfile = async (req, res) => {
     profile.profileCompletion = completion;
 
     await profile.save();
+
+    if (profile.city) {
+      let lat = profile.latitude;
+      let lon = profile.longitude;
+
+      if (lat === null || lon === null) {
+        const geocoded = await getCoordinatesFromText([profile.city, profile.state].filter(Boolean).join(', '));
+        if (geocoded) {
+          lat = geocoded.lat;
+          lon = geocoded.lon;
+          profile.latitude = lat;
+          profile.longitude = lon;
+          profile.locationUpdatedAt = new Date();
+          await profile.save();
+        }
+      }
+
+      if (lat !== null && lon !== null) {
+        await upsertLocationRecord({
+          name: profile.nearestLocation || profile.city,
+          latitude: lat,
+          longitude: lon,
+          type: 'provider',
+        });
+      }
+    }
 
     // Update rotation pool if applicable
     if (skills && city && profile.currentPlan !== 'free') {
@@ -141,8 +184,6 @@ const getDashboard = async (req, res) => {
       });
     }
 
-    await ensureDefaultProviderSubscription(req.user._id);
-
     const leads = await Lead.find({ provider: req.user._id })
       .sort({ createdAt: -1 })
       .limit(20)
@@ -154,7 +195,13 @@ const getDashboard = async (req, res) => {
       .populate('recruiter', 'name');
 
     // Subscription data
-    const { subscription, plan } = await getActiveSubscription(req.user._id);
+    let { subscription, plan } = await getActiveSubscription(req.user._id, 'provider');
+    if (!plan) {
+      await assignFreePlan(req.user._id, 'provider');
+      const refreshed = await getActiveSubscription(req.user._id, 'provider');
+      subscription = refreshed.subscription;
+      plan = refreshed.plan;
+    }
     const user = await User.findById(req.user._id).select('subscriptionBadge');
     const now = new Date();
     const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
@@ -228,6 +275,28 @@ const purchasePlan = async (req, res) => {
     const { planId } = req.body;
     const plan = await Plan.findById(planId);
     if (!plan) return res.status(404).json({ message: 'Plan not found' });
+    if (plan.type !== 'provider') {
+      return res.status(400).json({ message: 'Invalid plan type for provider purchase' });
+    }
+
+    let profile = await ProviderProfile.findOne({ user: req.user._id });
+    if (!profile) {
+      profile = await ProviderProfile.create({
+        user: req.user._id,
+        profileExpiresAt: new Date(Date.now() + 365 * 24 * 60 * 60 * 1000),
+      });
+    }
+
+    if (profile.currentPlan) {
+      const currentPlan = await Plan.findOne({ type: 'provider', slug: profile.currentPlan });
+      const currentOrder = Number(currentPlan?.sortOrder || 0);
+      const nextOrder = Number(plan.sortOrder || 0);
+      if (nextOrder <= currentOrder) {
+        return res.status(400).json({
+          message: `Only upgrades are allowed. Your current plan is '${currentPlan?.name || profile.currentPlan}'. Please choose a higher plan.`,
+        });
+      }
+    }
 
     // Create payment record (simulated)
     const payment = await Payment.create({
@@ -241,7 +310,6 @@ const purchasePlan = async (req, res) => {
     });
 
     // Update provider profile
-    const profile = await ProviderProfile.findOne({ user: req.user._id });
     profile.currentPlan = plan.slug;
     profile.planExpiresAt = new Date(Date.now() + plan.duration * 24 * 60 * 60 * 1000);
     profile.boostWeight = plan.boostWeight;
@@ -257,7 +325,19 @@ const purchasePlan = async (req, res) => {
     }
 
     // Create UserSubscription record and update badge
-    await assignPlanToUser(req.user._id, plan);
+    await assignPlanToUser(req.user._id, 'provider', plan);
+
+    await createNotification({
+      userId: req.user._id,
+      type: 'PLAN_PURCHASED',
+      title: 'Plan Purchased',
+      message: `Your ${plan.name} plan has been activated successfully`,
+      data: {
+        planId: plan._id,
+        planSlug: plan.slug,
+        paymentId: payment._id,
+      },
+    });
 
     res.json({ message: 'Plan purchased successfully', payment, profile });
   } catch (error) {
@@ -303,6 +383,16 @@ const getPublicProfile = async (req, res) => {
     const profile = await ProviderProfile.findById(req.params.id)
       .populate('user', 'name avatar');
     if (!profile) return res.status(404).json({ message: 'Provider not found' });
+
+    // Access control: provider cannot view another provider profile.
+    if (
+      req.user &&
+      req.user.activeRole === 'provider' &&
+      profile.user &&
+      profile.user._id.toString() !== req.user._id.toString()
+    ) {
+      return res.status(403).json({ message: 'Access denied for same-role profile view' });
+    }
 
     const reviews = await Review.find({ provider: profile.user._id })
       .sort({ createdAt: -1 })

@@ -6,7 +6,10 @@ const userSchema = new mongoose.Schema({
   email: { type: String, required: true, unique: true, lowercase: true, trim: true },
   phone: { type: String, default: '' },
   password: { type: String, minlength: 6 },
-  role: { type: String, enum: ['provider', 'recruiter', 'admin'], required: true },
+  roles: [{ type: String, enum: ['provider', 'recruiter', 'admin'] }],
+  activeRole: { type: String, enum: ['provider', 'recruiter', 'admin'] },
+  // Legacy field kept temporarily for old records. Avoid using in new logic.
+  role: { type: String, enum: ['provider', 'recruiter', 'admin'], required: false, select: false },
   avatar: { type: String, default: '' },
   profilePhoto: { type: String, default: '' },
   authProvider: { type: String, enum: ['email', 'google', 'whatsapp'], default: 'email' },
@@ -33,8 +36,8 @@ const userSchema = new mongoose.Schema({
     enum: ['en', 'hi', 'ar', 'ur', 'zh', 'ja', 'es', 'fr', 'de', 'ru', 'pt', 'id', 'bn', 'ta', 'te', 'mr'],
     default: 'en',
   },
-  country: { type: String, enum: ['IN', 'AE'], default: 'IN' },
-  currency: { type: String, enum: ['INR', 'AED', 'USD'], default: 'INR' },
+  country: { type: String, trim: true, uppercase: true, minlength: 2, maxlength: 2, default: 'US' },
+  currency: { type: String, trim: true, uppercase: true, minlength: 3, maxlength: 3, default: 'USD' },
   // Subscription validity
   accountExpiresAt: { type: Date },
   renewalReminderSent: { type: Boolean, default: false },
@@ -42,6 +45,29 @@ const userSchema = new mongoose.Schema({
   // Badge
   subscriptionBadge: { type: String, default: '' },
 }, { timestamps: true });
+
+userSchema.pre('validate', function (next) {
+  if (!Array.isArray(this.roles)) this.roles = [];
+
+  if (!this.activeRole) {
+    this.activeRole = this.roles[0] || this.role || null;
+  }
+
+  if (this.activeRole && !this.roles.includes(this.activeRole)) {
+    this.roles.push(this.activeRole);
+  }
+
+  if (this.roles.length === 0 && this.role) {
+    this.roles = [this.role];
+    this.activeRole = this.role;
+  }
+
+  if (this.activeRole) {
+    this.role = this.activeRole;
+  }
+
+  next();
+});
 
 userSchema.pre('save', async function (next) {
   if (!this.isModified('password') || !this.password) return next();

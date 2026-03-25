@@ -16,6 +16,8 @@ const subscriptionRoutes = require('./routes/subscriptionRoutes');
 const notificationRoutes = require('./routes/notificationRoutes');
 const { startCronJobs } = require('./utils/cronJobs');
 const { setIO } = require('./services/notificationService');
+const { detectLocaleFromRequest, reverseGeocodeCoordinates } = require('./utils/geoLocation');
+const { getExchangeRates } = require('./utils/exchangeRates');
 
 const app = express();
 const server = http.createServer(app);
@@ -39,6 +41,9 @@ io.on('connection', (socket) => {
 
 // Connect Database
 connectDB();
+
+const trustProxyHops = Number(process.env.TRUST_PROXY_HOPS || 0);
+app.set('trust proxy', Number.isInteger(trustProxyHops) && trustProxyHops > 0 ? trustProxyHops : false);
 
 // Security Middleware
 app.use(helmet());
@@ -85,12 +90,28 @@ app.use('/api/auth', authRoutes);
 app.use('/api/user', require('./routes/userRoutes'));
 app.use('/api/provider', providerRoutes);
 app.use('/api/recruiter', recruiterRoutes);
+// Debug: log incoming admin route requests to help diagnose 404/401 issues
+app.use('/api/admin', (req, res, next) => {
+  try {
+    const authPresent = !!(req.headers && req.headers.authorization);
+    console.log(`[ADMIN DEBUG] ${new Date().toISOString()} ${req.method} ${req.originalUrl} auth:${authPresent}`);
+  } catch (e) {
+    // ignore logging errors
+  }
+  next();
+});
 app.use('/api/admin', adminRoutes);
+
+// Debug ping for admin routing checks
+app.get('/api/admin/debug-ping', (req, res) => res.json({ ok: true, now: new Date().toISOString() }));
 app.use('/api/faq', require('./routes/faqRoutes'));
 app.use('/api/payments', require('./routes/paymentRoutes'));
 app.use('/api/jobs', jobRoutes);
 app.use('/api/subscriptions', subscriptionRoutes);
 app.use('/api/notifications', notificationRoutes);
+app.use('/api/profile', require('./routes/profileRoutes'));
+app.use('/api/reviews', require('./routes/reviewRoutes'));
+app.use('/api/location', require('./routes/locationRoutes'));
 
 // Health check
 app.get('/api/health', (req, res) => {
@@ -98,36 +119,72 @@ app.get('/api/health', (req, res) => {
 });
 
 // Localization: detect country from request
-app.get('/api/locale/detect', (req, res) => {
-  // Simple IP-based detection (can be enhanced with GeoIP)
-  // Default to India; UAE detection can be added with GeoIP service
-  let country = 'IN';
-  let currency = country === 'AE' ? 'AED' : 'INR';
-  let locale = 'en';
+app.get('/api/locale/detect', async (req, res) => {
+  const fallback = { country: 'US', currency: 'USD', locale: 'en' };
 
-  const auth = req.headers.authorization;
-  if (auth && auth.startsWith('Bearer')) {
-    try {
-      const jwt = require('jsonwebtoken');
-      const User = require('./models/User');
-      const decoded = jwt.verify(auth.split(' ')[1], process.env.JWT_SECRET);
-      if (decoded?.id) {
-        User.findById(decoded.id).select('country currency locale').then((user) => {
+  try {
+    const detected = await detectLocaleFromRequest(req);
+    const jwt = require('jsonwebtoken');
+    const User = require('./models/User');
+
+    const auth = req.headers.authorization;
+    if (auth && auth.startsWith('Bearer ')) {
+      try {
+        const decoded = jwt.verify(auth.split(' ')[1], process.env.JWT_SECRET);
+        if (decoded?.id) {
+          const user = await User.findById(decoded.id).select('country currency locale preferredLanguage');
           if (user) {
-            country = user.country || country;
-            currency = user.currency || currency;
-            locale = user.locale || locale;
+            const userCountry = user.country || '';
+            const userCurrency = user.currency || '';
+            const userLocale = user.preferredLanguage || user.locale || '';
+
+            if (userCountry && userCurrency && userLocale) {
+              return res.json({ country: userCountry, currency: userCurrency, locale: userLocale, source: 'user' });
+            }
+
+            user.country = user.country || detected.country;
+            user.currency = user.currency || detected.currency;
+            user.locale = user.locale || detected.locale;
+            user.preferredLanguage = user.preferredLanguage || user.locale;
+            await user.save();
+
+            return res.json({
+              country: user.country,
+              currency: user.currency,
+              locale: user.preferredLanguage || user.locale,
+              source: 'detected-and-synced',
+            });
           }
-          res.json({ country, currency, locale });
-        }).catch(() => res.json({ country, currency, locale }));
-        return;
+        }
+      } catch (_) {
+        // Ignore token decode errors for public fallback behavior.
       }
-    } catch (_) {
-      // fall back to defaults
     }
+
+    return res.json({
+      country: detected.country || fallback.country,
+      currency: detected.currency || fallback.currency,
+      locale: detected.locale || fallback.locale,
+      source: detected.source || 'detected',
+    });
+  } catch (_) {
+    return res.json(fallback);
+  }
+});
+
+// Reverse geocoding (free): lat/lng -> nearest city/state/country
+app.get('/api/locale/reverse-geocode', async (req, res) => {
+  const { lat, lng } = req.query;
+  if (lat === undefined || lng === undefined) {
+    return res.status(400).json({ message: 'lat and lng query params are required' });
   }
 
-  res.json({ country, currency, locale });
+  const result = await reverseGeocodeCoordinates(lat, lng);
+  if (!result) {
+    return res.status(400).json({ message: 'Unable to resolve nearest location for provided coordinates' });
+  }
+
+  return res.json(result);
 });
 
 // Currency config (public)
@@ -137,14 +194,24 @@ app.get('/api/locale/currencies', async (req, res) => {
     const settings = await AdminSetting.find({ category: 'currency' });
     const config = {};
     settings.forEach(s => { config[s.key] = s.value; });
+
+    const fallbackInrAed = parseFloat(config.exchange_rate_INR_AED) || 0.044;
+    const fallbackInrUsd = parseFloat(config.exchange_rate_INR_USD) || 0.012;
+    const exchangeRates = await getExchangeRates({
+      fallbackInrAed,
+      fallbackInrUsd,
+    });
+
     res.json({
       INR: { symbol: '₹', code: 'INR', locale: 'en-IN' },
       AED: { symbol: 'AED', code: 'AED', locale: 'en-AE' },
       USD: { symbol: '$', code: 'USD', locale: 'en-US' },
       exchangeRates: {
-        INR_AED: parseFloat(config.exchange_rate_INR_AED) || 0.044,
-        INR_USD: parseFloat(config.exchange_rate_INR_USD) || 0.012,
+        INR_AED: exchangeRates.INR_AED,
+        INR_USD: exchangeRates.INR_USD,
       },
+      exchangeSource: exchangeRates.source,
+      exchangeFetchedAt: exchangeRates.fetchedAt,
     });
   } catch (err) {
     res.status(500).json({ message: err.message });

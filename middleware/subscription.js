@@ -3,13 +3,18 @@ const Plan = require('../models/Plan');
 const JobPost = require('../models/JobPost');
 const Application = require('../models/Application');
 
+const getEffectiveRole = (user) => user.activeRole || (Array.isArray(user.roles) ? user.roles[0] : null) || user.role;
+
 /**
  * Get the active subscription + plan for a user.
  * Returns { subscription, plan } or { subscription: null, plan: null }.
  */
-async function getActiveSubscription(userId) {
+async function getActiveSubscription(userId, role) {
+  if (!role || role === 'admin') return { subscription: null, plan: null };
+
   const subscription = await UserSubscription.findOne({
     userId,
+    role,
     status: 'active',
     endDate: { $gt: new Date() },
   }).populate('planId');
@@ -24,11 +29,12 @@ async function getActiveSubscription(userId) {
  */
 const checkPostLimit = async (req, res, next) => {
   try {
-    let { subscription, plan } = await getActiveSubscription(req.user._id);
+    const activeRole = getEffectiveRole(req.user);
+    let { subscription, plan } = await getActiveSubscription(req.user._id, activeRole);
 
     // If no active subscription, use the free recruiter plan as default
     if (!plan) {
-      plan = await Plan.findOne({ type: 'recruiter', slug: 'free-recruiter' });
+      plan = await Plan.findOne({ type: 'recruiter', price: 0, isActive: true }).sort({ sortOrder: 1 });
       if (!plan) {
         return res.status(500).json({
           message: 'Free recruiter plan not configured. Please contact support.',
@@ -71,11 +77,12 @@ const checkPostLimit = async (req, res, next) => {
  */
 const checkApplyLimit = async (req, res, next) => {
   try {
-    let { subscription, plan } = await getActiveSubscription(req.user._id);
+    const activeRole = getEffectiveRole(req.user);
+    let { subscription, plan } = await getActiveSubscription(req.user._id, activeRole);
 
     // If no active subscription, use the free plan as default
     if (!plan) {
-      plan = await Plan.findOne({ type: 'provider', slug: 'free' });
+      plan = await Plan.findOne({ type: 'provider', price: 0, isActive: true }).sort({ sortOrder: 1 });
       if (!plan) {
         return res.status(500).json({
           message: 'Free plan not configured. Please contact support.',
@@ -117,7 +124,8 @@ const checkApplyLimit = async (req, res, next) => {
 const attachSubscription = async (req, res, next) => {
   try {
     if (req.user) {
-      const { subscription, plan } = await getActiveSubscription(req.user._id);
+      const activeRole = getEffectiveRole(req.user);
+      const { subscription, plan } = await getActiveSubscription(req.user._id, activeRole);
       req.subscription = subscription;
       req.plan = plan;
     }

@@ -6,6 +6,40 @@ const RotationPool = require('../models/RotationPool');
 const { getStripeInstance, getPaymentConfig } = require('../utils/stripe');
 const { updateUserBadge } = require('../services/badgeService');
 const UserSubscription = require('../models/UserSubscription');
+const { createNotification } = require('../services/notificationService');
+
+async function getCurrentActivePlan(userId, role) {
+  const activeSub = await UserSubscription.findOne({
+    userId,
+    role,
+    status: 'active',
+    endDate: { $gt: new Date() },
+  }).populate('planId');
+
+  return activeSub?.planId || null;
+}
+
+function isNonUpgrade(currentPlan, nextPlan) {
+  if (!currentPlan || !nextPlan) return false;
+  const currentOrder = Number(currentPlan.sortOrder || 0);
+  const nextOrder = Number(nextPlan.sortOrder || 0);
+  return nextOrder <= currentOrder;
+}
+
+async function notifyPlanPurchased(userId, plan, paymentId) {
+  if (!plan) return;
+  await createNotification({
+    userId,
+    type: 'PLAN_PURCHASED',
+    title: 'Plan Purchased',
+    message: `Your ${plan.name} plan has been activated successfully`,
+    data: {
+      planId: plan._id,
+      planSlug: plan.slug,
+      paymentId,
+    },
+  });
+}
 
 // Helper: update rotation pool
 async function updateRotationPool(skill, city, profileId) {
@@ -45,9 +79,10 @@ async function activateProviderPlan(userId, plan) {
   }
 
   // Create UserSubscription and update badge
-  await UserSubscription.updateMany({ userId, status: 'active' }, { status: 'expired' });
+  await UserSubscription.updateMany({ userId, role: 'provider', status: 'active' }, { status: 'expired' });
   await UserSubscription.create({
     userId,
+    role: 'provider',
     planId: plan._id,
     startDate: new Date(),
     endDate: new Date(Date.now() + plan.duration * 24 * 60 * 60 * 1000),
@@ -69,9 +104,10 @@ async function activateRecruiterPlan(userId, plan) {
   await profile.save();
 
   // Create UserSubscription and update badge
-  await UserSubscription.updateMany({ userId, status: 'active' }, { status: 'expired' });
+  await UserSubscription.updateMany({ userId, role: 'recruiter', status: 'active' }, { status: 'expired' });
   await UserSubscription.create({
     userId,
+    role: 'recruiter',
     planId: plan._id,
     startDate: new Date(),
     endDate: new Date(Date.now() + plan.duration * 24 * 60 * 60 * 1000),
@@ -80,6 +116,19 @@ async function activateRecruiterPlan(userId, plan) {
   await updateUserBadge(userId);
 
   return profile;
+}
+
+async function activatePlanByType(userId, plan) {
+  if (!plan) return null;
+  if (plan.type === 'provider') return activateProviderPlan(userId, plan);
+  if (plan.type === 'recruiter') return activateRecruiterPlan(userId, plan);
+  return null;
+}
+
+async function getProfileByPlanType(userId, planType) {
+  if (planType === 'provider') return ProviderProfile.findOne({ user: userId });
+  if (planType === 'recruiter') return RecruiterProfile.findOne({ user: userId });
+  return null;
 }
 
 /**
@@ -114,8 +163,17 @@ const createOrder = async (req, res) => {
     if (!plan) return res.status(404).json({ message: 'Plan not found' });
     if (!plan.isActive) return res.status(400).json({ message: 'Plan is not active' });
 
-    if (req.user.role !== plan.type && req.user.role !== 'admin') {
+    const currentRole = req.user.activeRole || req.user.role;
+    if (currentRole !== plan.type && currentRole !== 'admin') {
       return res.status(403).json({ message: 'Plan not available for your role' });
+    }
+
+    // Block non-upgrade purchases; only higher tier upgrades are allowed.
+    const activePlan = await getCurrentActivePlan(req.user._id, plan.type);
+    if (isNonUpgrade(activePlan, plan)) {
+      return res.status(400).json({
+        message: `Only upgrades are allowed. Your current plan is '${activePlan.name}'. Please choose a higher plan.`,
+      });
     }
 
     const config = await getPaymentConfig();
@@ -144,6 +202,8 @@ const createOrder = async (req, res) => {
       } else if (plan.type === 'recruiter') {
         profile = await activateRecruiterPlan(req.user._id, plan);
       }
+
+      await notifyPlanPurchased(req.user._id, plan, payment._id);
 
       return res.json({
         success: true,
@@ -207,6 +267,7 @@ const createOrder = async (req, res) => {
       currency: currency.toUpperCase(),
       type: 'plan_purchase',
       status: 'created',
+      transactionId: session.id,
       stripeSessionId: session.id,
       metadata: { planName: plan.name, planSlug: plan.slug },
     });
@@ -251,8 +312,25 @@ const verifyPayment = async (req, res) => {
       });
     }
 
+    const existingPayment = await Payment.findOne({ stripeSessionId: sessionId }).populate('plan');
+
+    if (!existingPayment) {
+      return res.status(404).json({ message: 'Payment record not found' });
+    }
+
+    // Idempotency: if already completed earlier (webhook or previous verify call), do not re-apply credits/plan.
+    if (existingPayment.status === 'completed') {
+      const profile = await (existingPayment.plan ? getProfileByPlanType(existingPayment.user, existingPayment.plan.type) : null);
+      return res.json({
+        success: true,
+        message: 'Payment already verified',
+        payment: existingPayment,
+        profile,
+      });
+    }
+
     const payment = await Payment.findOneAndUpdate(
-      { stripeSessionId: sessionId },
+      { _id: existingPayment._id },
       {
         status: 'completed',
         stripePaymentIntentId: session.payment_intent || '',
@@ -262,18 +340,12 @@ const verifyPayment = async (req, res) => {
       { new: true }
     ).populate('plan');
 
-    if (!payment) {
-      return res.status(404).json({ message: 'Payment record not found' });
-    }
-
     let profile;
     const plan = payment.plan;
     if (plan) {
-      if (plan.type === 'provider') {
-        profile = await activateProviderPlan(payment.user, plan);
-      } else if (plan.type === 'recruiter') {
-        profile = await activateRecruiterPlan(payment.user, plan);
-      }
+      profile = await activatePlanByType(payment.user, plan);
+
+      await notifyPlanPurchased(payment.user, plan, payment._id);
     }
 
     res.json({
@@ -347,22 +419,23 @@ const stripeWebhook = async (req, res) => {
     if (event.type === 'checkout.session.completed') {
       const session = event.data.object;
       if (session.payment_status === 'paid') {
-        const payment = await Payment.findOneAndUpdate(
-          { stripeSessionId: session.id },
-          {
-            status: 'completed',
-            stripePaymentIntentId: session.payment_intent || '',
-            transactionId: session.payment_intent || session.id,
-            paymentMethod: 'card',
-          },
-          { new: true }
-        ).populate('plan');
+        const existingPayment = await Payment.findOne({ stripeSessionId: session.id }).populate('plan');
 
-        if (payment && payment.plan) {
-          if (payment.plan.type === 'provider') {
-            await activateProviderPlan(payment.user, payment.plan);
-          } else if (payment.plan.type === 'recruiter') {
-            await activateRecruiterPlan(payment.user, payment.plan);
+        if (existingPayment && existingPayment.plan && existingPayment.status !== 'completed') {
+          const payment = await Payment.findOneAndUpdate(
+            { _id: existingPayment._id },
+            {
+              status: 'completed',
+              stripePaymentIntentId: session.payment_intent || '',
+              transactionId: session.payment_intent || session.id,
+              paymentMethod: 'card',
+            },
+            { new: true }
+          ).populate('plan');
+
+          if (payment?.plan) {
+            await activatePlanByType(payment.user, payment.plan);
+            await notifyPlanPurchased(payment.user, payment.plan, payment._id);
           }
         }
       }
@@ -419,7 +492,8 @@ const getPaymentById = async (req, res) => {
     if (!payment) return res.status(404).json({ message: 'Payment not found' });
 
     // Only allow own payment or admin
-    if (payment.user._id.toString() !== req.user._id.toString() && req.user.role !== 'admin') {
+      const currentRole = req.user.activeRole || req.user.role;
+      if (payment.user._id.toString() !== req.user._id.toString() && currentRole !== 'admin') {
       return res.status(403).json({ message: 'Not authorized' });
     }
 

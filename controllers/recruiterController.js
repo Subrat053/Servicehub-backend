@@ -10,13 +10,46 @@ const User = require('../models/User');
 const VisitHistory = require('../models/VisitHistory');
 const WhatsappLog = require('../models/WhatsappLog');
 const Application = require('../models/Application');
+const Notification = require('../models/Notification');
 const { sendWhatsAppMessage } = require('../utils/messaging');
 const { uploadToCloudinary, deleteFromCloudinary } = require('../utils/cloudinary');
-const { notifyProvidersOfNewJob } = require('../services/notificationService');
+const { createNotification, notifyProvidersOfNewJob } = require('../services/notificationService');
 const { getActiveSubscription } = require('../middleware/subscription');
-const { assignPlanToUser } = require('./subscriptionController');
+const { assignPlanToUser, assignFreePlan } = require('./subscriptionController');
+const { getCoordinatesFromText, upsertLocationRecord } = require('../services/locationService');
+const {
+  getProvidersByLocation,
+  filterActiveSubscriptions,
+  separateProviders,
+  applyRotation,
+  mergeFinalList,
+} = require('../services/providerService');
 const path = require('path');
 const fs = require('fs');
+
+const toCoordinate = (value, min, max) => {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return null;
+  if (parsed < min || parsed > max) return null;
+  return parsed;
+};
+
+const THIRTY_DAYS_MS = 30 * 24 * 60 * 60 * 1000;
+
+const ensureRecruiterMonthlyFreeQuota = async (profile) => {
+  if (!profile) return;
+  if (profile.currentPlan !== 'free') return;
+
+  const now = new Date();
+  const needsReset = !profile.freeUnlockResetAt || new Date(profile.freeUnlockResetAt).getTime() <= now.getTime();
+
+  if (needsReset) {
+    profile.unlocksRemaining = 2;
+    profile.unlockPackSize = 2;
+    profile.freeUnlockResetAt = new Date(now.getTime() + THIRTY_DAYS_MS);
+    await profile.save();
+  }
+};
 
 // @desc    Get recruiter dashboard
 // @route   GET /api/recruiter/dashboard
@@ -28,8 +61,13 @@ const getDashboard = async (req, res) => {
       profile = await RecruiterProfile.create({
         user: req.user._id,
         freeViewResetAt: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),
+        freeUnlockResetAt: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),
+        unlocksRemaining: 2,
+        unlockPackSize: 2,
       });
     }
+
+    await ensureRecruiterMonthlyFreeQuota(profile);
 
     const jobs = await JobPost.find({ recruiter: req.user._id }).sort({ createdAt: -1 }).limit(10);
     const recentUnlocks = await Lead.find({ recruiter: req.user._id, isUnlocked: true })
@@ -41,7 +79,13 @@ const getDashboard = async (req, res) => {
       });
 
     // Subscription data
-    const { plan } = await getActiveSubscription(req.user._id);
+    let { subscription, plan } = await getActiveSubscription(req.user._id, 'recruiter');
+    if (!plan) {
+      await assignFreePlan(req.user._id, 'recruiter');
+      const refreshed = await getActiveSubscription(req.user._id, 'recruiter');
+      subscription = refreshed.subscription;
+      plan = refreshed.plan;
+    }
     const now = new Date();
     const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
     const jobsThisMonth = await JobPost.countDocuments({ recruiter: req.user._id, createdAt: { $gte: startOfMonth } });
@@ -66,6 +110,8 @@ const getDashboard = async (req, res) => {
         freeProfileViews: profile.freeProfileViews,
         unlocksRemaining: profile.unlocksRemaining,
         currentPlan: profile.currentPlan,
+        planStatus: subscription?.status || 'inactive',
+        planEndDate: subscription?.endDate || null,
       },
     });
   } catch (error) {
@@ -77,12 +123,18 @@ const getDashboard = async (req, res) => {
 // @route   PUT /api/recruiter/profile
 const updateProfile = async (req, res) => {
   try {
-    const { companyName, companyType, city, state, description, skillsNeeded } = req.body;
+    const {
+      companyName, companyType, city, state, description, skillsNeeded,
+      nearestLocation, latitude, longitude,
+    } = req.body;
     let profile = await RecruiterProfile.findOne({ user: req.user._id });
     if (!profile) {
       profile = await RecruiterProfile.create({
         user: req.user._id,
         freeViewResetAt: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),
+        freeUnlockResetAt: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),
+        unlocksRemaining: 2,
+        unlockPackSize: 2,
       });
     }
 
@@ -90,6 +142,14 @@ const updateProfile = async (req, res) => {
     if (companyType !== undefined) profile.companyType = companyType;
     if (city !== undefined) profile.city = city;
     if (state !== undefined) profile.state = state;
+    if (typeof nearestLocation === 'string') profile.nearestLocation = nearestLocation.trim();
+    const nextLat = toCoordinate(latitude, -90, 90);
+    const nextLng = toCoordinate(longitude, -180, 180);
+    if (nextLat !== null && nextLng !== null) {
+      profile.latitude = nextLat;
+      profile.longitude = nextLng;
+      profile.locationUpdatedAt = new Date();
+    }
     if (description !== undefined) profile.description = description;
     if (Array.isArray(skillsNeeded)) profile.skillsNeeded = skillsNeeded;
 
@@ -98,6 +158,33 @@ const updateProfile = async (req, res) => {
     }
 
     await profile.save();
+
+    if (profile.city) {
+      let lat = profile.latitude;
+      let lon = profile.longitude;
+
+      if (lat === null || lon === null) {
+        const geocoded = await getCoordinatesFromText([profile.city, profile.state].filter(Boolean).join(', '));
+        if (geocoded) {
+          lat = geocoded.lat;
+          lon = geocoded.lon;
+          profile.latitude = lat;
+          profile.longitude = lon;
+          profile.locationUpdatedAt = new Date();
+          await profile.save();
+        }
+      }
+
+      if (lat !== null && lon !== null) {
+        await upsertLocationRecord({
+          name: profile.nearestLocation || profile.city,
+          latitude: lat,
+          longitude: lon,
+          type: 'recruiter',
+        });
+      }
+    }
+
     res.json(profile);
   } catch (error) {
     res.status(500).json({ message: 'Server error', error: error.message });
@@ -111,11 +198,45 @@ const escapeRegex = (str) => str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 // @route   GET /api/recruiter/search?skill=&city=&rating=&experience=&verified=&page=&limit=
 const searchProviders = async (req, res) => {
   try {
-    const { skill, city, tier, rating, experience, verified, page = 1, limit = 20 } = req.query;
+    const {
+      skill,
+      category,
+      city,
+      tier,
+      rating,
+      experience,
+      verified,
+      lat,
+      lon,
+      radius,
+      page = 1,
+      limit = 20,
+    } = req.query;
+
+    const skillTerm = String(skill || category || '').trim();
+    const pageNum = Math.max(1, parseInt(page, 10) || 1);
+    const limitNum = Math.max(1, parseInt(limit, 10) || 20);
+    const featuredLimit = Math.max(1, parseInt(process.env.FEATURED_LIMIT || 5, 10));
+    const rotationIntervalSec = Math.max(1, parseInt(process.env.ROTATION_INTERVAL_SEC || 60, 10));
+    const radiusKm = Number.isFinite(Number(radius)) ? Number(radius) : Number(process.env.SEARCH_RADIUS_KM || 50);
+
+    const hasLat = lat !== undefined;
+    const hasLon = lon !== undefined;
+    const latNum = hasLat ? Number(lat) : null;
+    const lonNum = hasLon ? Number(lon) : null;
+
+    if ((hasLat && !hasLon) || (!hasLat && hasLon)) {
+      return res.status(400).json({ message: 'Both lat and lon are required for geo search.' });
+    }
+    if (hasLat && hasLon) {
+      if (!Number.isFinite(latNum) || !Number.isFinite(lonNum) || latNum < -90 || latNum > 90 || lonNum < -180 || lonNum > 180) {
+        return res.status(400).json({ message: 'Invalid lat/lon values.' });
+      }
+    }
 
     const filter = {};
     // Skill: substring match (e.g. "Tutor" matches "Online tutor")
-    if (skill) filter.skills = { $regex: escapeRegex(skill.trim()), $options: 'i' };
+    if (skillTerm) filter.skills = { $regex: escapeRegex(skillTerm), $options: 'i' };
     if (city) {
       // City: prefix-tolerant regex – trims 1 trailing char to absorb typos like "Kolkataa" → "Kolkata"
       const cityQuery = city.trim();
@@ -130,87 +251,66 @@ const searchProviders = async (req, res) => {
     if (verified === 'true') filter.isVerified = true;
     filter.isApproved = true;
 
-    // Get rotation pool providers for top row (max 5, round-robin by last_shown)
-    let rotationProviders = [];
-    if (skill || city) {
-      const poolQuery = {};
-      if (skill) poolQuery.skill = skill.toLowerCase();
-      if (city) poolQuery.city = city.toLowerCase();
-
-      const pools = await RotationPool.find(poolQuery).populate({
-        path: 'providers.provider',
-        populate: { path: 'user', select: 'name avatar' },
-      });
-
-      // Merge providers from all matching pools, sort by lastShown (round-robin)
-      const allPoolProviders = [];
-      for (const pool of pools) {
-        for (const p of pool.providers) {
-          if (p.provider && p.provider.user) {
-            allPoolProviders.push({ ...p.toObject(), pool });
-          }
-        }
-      }
-      // Sort by lastShown ascending (least recently shown first)
-      allPoolProviders.sort((a, b) => new Date(a.lastShown) - new Date(b.lastShown));
-
-      const now = new Date();
-      const topN = allPoolProviders.slice(0, 5);
-      rotationProviders = topN.map(p => p.provider).filter(Boolean);
-
-      // Update lastShown for these providers (round-robin)
-      for (const p of topN) {
-        if (p.pool) {
-          const pEntry = p.pool.providers.find(
-            pp => pp.provider && pp.provider._id.toString() === p.provider._id.toString()
-          );
-          if (pEntry) {
-            pEntry.lastShown = now;
-          }
-          p.pool.currentIndex = (p.pool.currentIndex + 1) % Math.max(p.pool.providers.length, 1);
-          await p.pool.save();
-        }
-      }
-    }
-
-    const skip = (parseInt(page) - 1) * parseInt(limit);
-
-    // Get featured providers
-    const featured = await ProviderProfile.find({
-      ...filter,
-      currentPlan: { $in: ['featured', 'pro'] },
-    })
+    const sortConfig = { boostWeight: -1, rating: -1, createdAt: -1 };
+    let candidates = await ProviderProfile.find(filter)
       .populate('user', 'name avatar email')
-      .sort({ boostWeight: -1 })
-      .limit(5);
-
-    // Get normal providers
-    let normal = await ProviderProfile.find(filter)
-      .populate('user', 'name avatar email')
-      .sort({ boostWeight: -1, rating: -1, createdAt: -1 })
-      .skip(skip)
-      .limit(parseInt(limit));
-
-    let total = await ProviderProfile.countDocuments(filter);
+      .sort(sortConfig)
+      .lean();
 
     // 2-pass fallback: if skill+city combo returns 0, retry with skill only
     // (city may have a typo that prefix-regex couldn't absorb)
-    if (total === 0 && skill && city) {
-      const skillOnlyFilter = { isApproved: true, skills: { $regex: escapeRegex(skill.trim()), $options: 'i' } };
+    if (candidates.length === 0 && skillTerm && city) {
+      const skillOnlyFilter = { isApproved: true, skills: { $regex: escapeRegex(skillTerm), $options: 'i' } };
       if (tier) skillOnlyFilter.tier = tier;
       if (rating) skillOnlyFilter.rating = { $gte: parseFloat(rating) };
       if (experience) skillOnlyFilter.experience = { $regex: escapeRegex(experience), $options: 'i' };
       if (verified === 'true') skillOnlyFilter.isVerified = true;
-      normal = await ProviderProfile.find(skillOnlyFilter)
+      candidates = await ProviderProfile.find(skillOnlyFilter)
         .populate('user', 'name avatar email')
-        .sort({ boostWeight: -1, rating: -1, createdAt: -1 })
-        .skip(skip)
-        .limit(parseInt(limit));
-      total = await ProviderProfile.countDocuments(skillOnlyFilter);
+        .sort(sortConfig)
+        .lean();
+    }
+
+    // Geo-aware filtering (optional; if lat/lon provided)
+    if (hasLat && hasLon) {
+      candidates = await getProvidersByLocation(latNum, lonNum, radiusKm, candidates);
+    }
+
+    const activeSubscriptionProviders = filterActiveSubscriptions(candidates);
+    const { featuredProviders: activeFeatured } = separateProviders(activeSubscriptionProviders);
+    const rotatedFeatured = applyRotation(activeFeatured, rotationIntervalSec, featuredLimit);
+    const featuredIds = new Set(rotatedFeatured.map((provider) => provider._id?.toString()).filter(Boolean));
+
+    const normalProviders = candidates.filter((provider) => !featuredIds.has(provider._id?.toString()));
+    const combinedProviders = mergeFinalList(rotatedFeatured, normalProviders);
+
+    const skip = (pageNum - 1) * limitNum;
+    const featured = rotatedFeatured;
+    const normal = normalProviders.slice(skip, skip + limitNum);
+    const combined = combinedProviders.slice(skip, skip + limitNum);
+    const total = combinedProviders.length;
+
+    // Keep legacy rotation key for backward compatibility.
+    const rotationProviders = featured;
+
+    if (skillTerm || city) {
+      await RotationPool.findOneAndUpdate(
+        { skill: (skillTerm || 'any').toLowerCase(), city: (city || 'any').toLowerCase() },
+        {
+          $setOnInsert: {
+            skill: (skillTerm || 'any').toLowerCase(),
+            city: (city || 'any').toLowerCase(),
+            maxPoolSize: featuredLimit,
+            rotationInterval: rotationIntervalSec,
+          },
+          $set: { rotationInterval: rotationIntervalSec, maxPoolSize: featuredLimit },
+        },
+        { upsert: true, new: false }
+      );
     }
 
     // Track recruiter free view + save search history
-    if (req.user && req.user.role === 'recruiter') {
+    if (req.user && req.user.activeRole === 'recruiter') {
       const recruiterProfile = await RecruiterProfile.findOne({ user: req.user._id });
       if (recruiterProfile) {
         recruiterProfile.freeProfileViews += 1;
@@ -218,13 +318,13 @@ const searchProviders = async (req, res) => {
       }
 
       // Save search history
-      if (skill || city) {
+      if (skillTerm || city) {
         await VisitHistory.create({
           user: req.user._id,
           type: 'search',
-          searchQuery: [skill, city].filter(Boolean).join(' in '),
+          searchQuery: [skillTerm, city].filter(Boolean).join(' in '),
           searchCity: city || '',
-          searchSkill: skill || '',
+          searchSkill: skillTerm || '',
         });
       }
     }
@@ -232,12 +332,14 @@ const searchProviders = async (req, res) => {
     res.json({
       rotation: rotationProviders,
       featured,
-      providers: normal,
+      normal,
+      combined,
+      providers: combined,
       pagination: {
-        page: parseInt(page),
-        limit: parseInt(limit),
+        page: pageNum,
+        limit: limitNum,
         total,
-        pages: Math.ceil(total / parseInt(limit)),
+        pages: Math.ceil(total / limitNum),
       },
     });
   } catch (error) {
@@ -251,6 +353,8 @@ const viewProvider = async (req, res) => {
   try {
     const recruiterProfile = await RecruiterProfile.findOne({ user: req.user._id });
     if (!recruiterProfile) return res.status(404).json({ message: 'Profile not found' });
+
+    await ensureRecruiterMonthlyFreeQuota(recruiterProfile);
 
     const FREE_LIMIT = parseInt(process.env.FREE_PROFILE_VIEW_LIMIT || 10);
     const isUnlimited = ['business', 'enterprise'].includes(recruiterProfile.currentPlan);
@@ -299,6 +403,30 @@ const viewProvider = async (req, res) => {
       recruiter: req.user._id,
       type: 'profile_view',
     });
+
+    // Optional rate-limit: emit profile view notification at most once per recruiter/provider pair per 6 hours.
+    const sixHoursAgo = new Date(Date.now() - 6 * 60 * 60 * 1000);
+    const recentProfileViewedNotification = await Notification.findOne({
+      userId: provider.user._id,
+      type: 'PROFILE_VIEWED',
+      'data.recruiterId': req.user._id,
+      createdAt: { $gte: sixHoursAgo },
+    }).lean();
+
+    if (!recentProfileViewedNotification) {
+      await createNotification({
+        userId: provider.user._id,
+        type: 'PROFILE_VIEWED',
+        title: 'Profile Viewed',
+        message: 'Your profile was viewed by a recruiter',
+        data: {
+          recruiterId: req.user._id,
+          recruiterName: req.user.name,
+          providerProfileId: provider._id,
+        },
+      });
+    }
+
     provider.leadsReceived += 1;
     await provider.save();
 
@@ -428,6 +556,32 @@ const unlockContact = async (req, res) => {
       }
     }
 
+    // In-app notifications to provider
+    await createNotification({
+      userId: providerProfile.user._id,
+      type: 'CONTACT_UNLOCKED',
+      title: 'Contact Unlocked',
+      message: 'Your profile was unlocked by a recruiter',
+      data: {
+        recruiterId: req.user._id,
+        recruiterName: req.user.name,
+        leadId: lead._id,
+      },
+    });
+
+    await createNotification({
+      userId: providerProfile.user._id,
+      type: 'NEW_LEAD',
+      title: 'New Lead',
+      message: 'You have a new lead',
+      data: {
+        recruiterId: req.user._id,
+        recruiterName: req.user.name,
+        leadId: lead._id,
+        source: 'contact_unlock',
+      },
+    });
+
     res.json({
       message: 'Contact unlocked successfully',
       contact: {
@@ -502,8 +656,11 @@ const postJob = async (req, res) => {
     job.matchedProviders = matchedProviders.map(p => p._id);
     await job.save();
 
-    // Notify providers with notification-enabled subscriptions (in-app + socket.io)
-    await notifyProvidersOfNewJob(job);
+    // Notify matched providers.
+    await notifyProvidersOfNewJob(
+      job,
+      matchedProviders.map((p) => p.user?._id).filter(Boolean)
+    );
 
     res.status(201).json({ message: 'Job posted successfully', job, matchedCount: matchedProviders.length });
   } catch (error) {
@@ -540,6 +697,31 @@ const purchasePlan = async (req, res) => {
     const { planId } = req.body;
     const plan = await Plan.findById(planId);
     if (!plan) return res.status(404).json({ message: 'Plan not found' });
+    if (plan.type !== 'recruiter') {
+      return res.status(400).json({ message: 'Invalid plan type for recruiter purchase' });
+    }
+
+    let profile = await RecruiterProfile.findOne({ user: req.user._id });
+    if (!profile) {
+      profile = await RecruiterProfile.create({
+        user: req.user._id,
+        freeViewResetAt: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),
+        freeUnlockResetAt: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),
+        unlocksRemaining: 2,
+        unlockPackSize: 2,
+      });
+    }
+
+    if (profile.currentPlan) {
+      const currentPlan = await Plan.findOne({ type: 'recruiter', slug: profile.currentPlan });
+      const currentOrder = Number(currentPlan?.sortOrder || 0);
+      const nextOrder = Number(plan.sortOrder || 0);
+      if (nextOrder <= currentOrder) {
+        return res.status(400).json({
+          message: `Only upgrades are allowed. Your current plan is '${currentPlan?.name || profile.currentPlan}'. Please choose a higher plan.`,
+        });
+      }
+    }
 
     const payment = await Payment.create({
       user: req.user._id,
@@ -551,7 +733,6 @@ const purchasePlan = async (req, res) => {
       transactionId: `TXN_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
     });
 
-    const profile = await RecruiterProfile.findOne({ user: req.user._id });
     profile.currentPlan = plan.slug;
     profile.planExpiresAt = new Date(Date.now() + plan.duration * 24 * 60 * 60 * 1000);
     profile.unlocksRemaining += plan.unlockCredits || 0;
@@ -559,7 +740,19 @@ const purchasePlan = async (req, res) => {
     await profile.save();
 
     // Create UserSubscription record and update badge
-    await assignPlanToUser(req.user._id, plan);
+    await assignPlanToUser(req.user._id, 'recruiter', plan);
+
+    await createNotification({
+      userId: req.user._id,
+      type: 'PLAN_PURCHASED',
+      title: 'Plan Purchased',
+      message: `Your ${plan.name} plan has been activated successfully`,
+      data: {
+        planId: plan._id,
+        planSlug: plan.slug,
+        paymentId: payment._id,
+      },
+    });
 
     res.json({ message: 'Plan purchased successfully', payment, profile });
   } catch (error) {
@@ -683,6 +876,11 @@ const getMyHistory = async (req, res) => {
 // @route   GET /api/recruiter/unlock-status/:providerId
 const checkUnlockStatus = async (req, res) => {
   try {
+    const recruiterProfile = await RecruiterProfile.findOne({ user: req.user._id });
+    if (recruiterProfile) {
+      await ensureRecruiterMonthlyFreeQuota(recruiterProfile);
+    }
+
     const provider = await ProviderProfile.findById(req.params.providerId).populate('user', '_id');
     if (!provider) return res.status(404).json({ message: 'Provider not found' });
 

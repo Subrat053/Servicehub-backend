@@ -13,6 +13,8 @@
  *   WHATSAPP_DEV_MODE            – Set "true" to skip API calls and print OTP to console
  */
 
+const { sendMail } = require('../services/mailService');
+
 const WHATSAPP_API_VERSION = 'v21.0';
 
 /* ─────────────────────────────────────────────
@@ -162,11 +164,38 @@ const sendPhoneOTP = async (phone, otp) => {
 };
 
 /* ─────────────────────────────────────────────
-   Send Email OTP
-   TODO: Replace with real service (Nodemailer / SendGrid / Resend)
+   Send Email OTP via SMTP
 ───────────────────────────────────────────── */
 const sendEmailOTP = async (email, otp) => {
-  console.log(`[Email OTP] ${otp} → ${email}`);
+  const validityMinutes = Number(process.env.EMAIL_OTP_VALIDITY_MINUTES || 10);
+  const appName = process.env.EMAIL_FROM_NAME || 'ServiceHub';
+
+  const subject = `${appName} email verification code`;
+  const text = [
+    `Your ${appName} verification code is ${otp}.`,
+    `This code is valid for ${validityMinutes} minutes.`,
+    'If you did not request this code, you can ignore this email.',
+  ].join('\n\n');
+
+  const html = `
+    <div style="font-family:Arial,sans-serif;line-height:1.6;color:#111827;max-width:520px;margin:0 auto;padding:24px;">
+      <h2 style="margin:0 0 10px;color:#1f2937;">Verify your email</h2>
+      <p style="margin:0 0 14px;">Use this OTP to continue your ${appName} signup/login:</p>
+      <div style="display:inline-block;padding:12px 20px;border:1px solid #d1d5db;border-radius:8px;background:#f9fafb;font-size:28px;letter-spacing:6px;font-weight:700;">
+        ${otp}
+      </div>
+      <p style="margin:14px 0 0;">This code expires in ${validityMinutes} minutes.</p>
+      <p style="margin:12px 0 0;font-size:12px;color:#6b7280;">If you did not request this code, you can safely ignore this email.</p>
+    </div>
+  `;
+
+  await sendMail({
+    to: email,
+    subject,
+    text,
+    html,
+  });
+
   return { success: true, message: 'OTP sent via email' };
 };
 
