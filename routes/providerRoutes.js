@@ -17,6 +17,7 @@ const {
   getMyHistory,
 } = require('../controllers/providerController');
 const { protect, authorizeRoleFromActive } = require('../middleware/auth');
+const { ensureProviderApproved } = require('../middleware/providerApproval');
 const upload = require('../middleware/upload');
 
 // Optional auth: attach req.user when token is provided.
@@ -37,17 +38,17 @@ const optionalAuth = async (req, res, next) => {
   next();
 };
 
-router.get('/profile', protect, authorizeRoleFromActive('provider'), getMyProfile);
-router.put('/profile', protect, authorizeRoleFromActive('provider'), updateProfile);
-router.get('/dashboard', protect, authorizeRoleFromActive('provider'), getDashboard);
-router.get('/plans', protect, authorizeRoleFromActive('provider'), getPlans);
-router.post('/plans/purchase', protect, authorizeRoleFromActive('provider'), purchasePlan);
-router.get('/leads', protect, authorizeRoleFromActive('provider'), getMyLeads);
-router.put('/leads/:id', protect, authorizeRoleFromActive('provider'), updateLeadStatus);
-router.get('/history', protect, authorizeRoleFromActive('provider'), getMyHistory);
+router.get('/profile', protect, authorizeRoleFromActive('provider'), ensureProviderApproved, getMyProfile);
+router.put('/profile', protect, authorizeRoleFromActive('provider'), ensureProviderApproved, updateProfile);
+router.get('/dashboard', protect, authorizeRoleFromActive('provider'), ensureProviderApproved, getDashboard);
+router.get('/plans', protect, authorizeRoleFromActive('provider'), ensureProviderApproved, getPlans);
+router.post('/plans/purchase', protect, authorizeRoleFromActive('provider'), ensureProviderApproved, purchasePlan);
+router.get('/leads', protect, authorizeRoleFromActive('provider'), ensureProviderApproved, getMyLeads);
+router.put('/leads/:id', protect, authorizeRoleFromActive('provider'), ensureProviderApproved, updateLeadStatus);
+router.get('/history', protect, authorizeRoleFromActive('provider'), ensureProviderApproved, getMyHistory);
 router.get('/public/:id', optionalAuth, getPublicProfile);
-router.post('/profile/photo', protect, authorizeRoleFromActive('provider'), upload.single('profilePhoto'), uploadProfilePhoto);
-router.delete('/profile/photo', protect, authorizeRoleFromActive('provider'), deleteProfilePhoto);
-router.post('/profile/document', protect, authorizeRoleFromActive('provider'), upload.single('document'), uploadDocument);
+router.post('/profile/photo', protect, authorizeRoleFromActive('provider'), ensureProviderApproved, upload.single('profilePhoto'), uploadProfilePhoto);
+router.delete('/profile/photo', protect, authorizeRoleFromActive('provider'), ensureProviderApproved, deleteProfilePhoto);
+router.post('/profile/document', protect, authorizeRoleFromActive('provider'), ensureProviderApproved, upload.single('document'), uploadDocument);
 
 module.exports = router;

@@ -6,6 +6,9 @@
   "scripts": {
     "start": "node server.js",
     "dev": "nodemon server.js",
+    "port:check": "node utils/port-tools.js check 5000",
+    "port:kill": "node utils/port-tools.js kill 5000",
+    "dev:clean": "npm run port:kill && npm run dev",
     "seed": "node utils/seed.js",
     "seed:fresh": "node utils/seedFreshState.js",
     "migrate:reviews": "node utils/migrateReviews.js --write",

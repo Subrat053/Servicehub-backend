@@ -380,8 +380,12 @@ const updateLeadStatus = async (req, res) => {
 // @route   GET /api/provider/public/:id
 const getPublicProfile = async (req, res) => {
   try {
-    const profile = await ProviderProfile.findById(req.params.id)
+    let profile = await ProviderProfile.findById(req.params.id)
       .populate('user', 'name avatar');
+    if (!profile) {
+      profile = await ProviderProfile.findOne({ user: req.params.id })
+        .populate('user', 'name avatar');
+    }
     if (!profile) return res.status(404).json({ message: 'Provider not found' });
 
     // Access control: provider cannot view another provider profile.

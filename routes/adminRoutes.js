@@ -5,6 +5,10 @@ const {
   getUsers,
   getUserDetail,
   toggleBlockUser,
+  createManager,
+  getManagers,
+  deleteManager,
+  getApprovalLogs,
   approveProvider,
   approveRecruiter,
   getProviders,
@@ -50,20 +54,29 @@ router.put('/content/:type', require('../middleware/auth').protect, require('../
 
 const { protect, authorize } = require('../middleware/auth');
 
-// All admin routes below require admin role
-router.use(protect, authorize('admin'));
+// Admin and manager authenticated scope
+router.use(protect, authorize('admin', 'manager'));
+
+// Manager-capable approval routes
+router.get('/providers', getProviders);
+router.put('/providers/:id/approve', approveProvider);
+router.get('/recruiters', getRecruiters);
+router.put('/recruiters/:id/approve', approveRecruiter);
+
+// Admin-only routes
+router.use(authorize('admin'));
 
 router.get('/dashboard', getDashboard);
 router.get('/users', getUsers);
 router.get('/users/:id', getUserDetail);
 router.put('/users/:id/block', toggleBlockUser);
+router.post('/managers', createManager);
+router.get('/managers', getManagers);
+router.delete('/managers/:id', deleteManager);
+router.get('/approval-logs', getApprovalLogs);
 router.delete('/users/:id', deleteUser);
-router.put('/providers/:id/approve', approveProvider);
 router.delete('/providers/:id', deleteProvider);
-router.get('/providers', getProviders);
-router.put('/recruiters/:id/approve', approveRecruiter);
 router.delete('/recruiters/:id', deleteRecruiter);
-router.get('/recruiters', getRecruiters);
 router.get('/plans', getAllPlans);
 router.post('/plans', createPlan);
 router.put('/plans/:id', updatePlan);

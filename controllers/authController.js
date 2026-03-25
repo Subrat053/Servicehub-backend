@@ -33,7 +33,11 @@ const normalizeRoles = (user) => {
   const roles = Array.isArray(user.roles) ? [...new Set(user.roles)] : [];
   if (user.role && !roles.includes(user.role)) roles.push(user.role);
   if (user.activeRole && !roles.includes(user.activeRole)) roles.push(user.activeRole);
-  const activeRole = user.activeRole || roles[0] || user.role || null;
+
+  let activeRole = user.activeRole || roles[0] || user.role || null;
+  if (roles.includes('admin')) activeRole = 'admin';
+  else if (roles.includes('manager')) activeRole = 'manager';
+
   return { roles, activeRole };
 };
 
@@ -633,6 +637,10 @@ const switchRole = async (req, res) => {
     if (!user) return res.status(404).json({ message: 'User not found' });
 
     const normalized = normalizeRoles(user);
+    if (normalized.roles.includes('admin') || normalized.roles.includes('manager')) {
+      return res.status(403).json({ message: 'Role switching is not available for admin or manager accounts.' });
+    }
+
     const nextRoles = [...new Set([...normalized.roles, role])];
 
     user.roles = nextRoles;

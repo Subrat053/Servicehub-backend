@@ -234,6 +234,18 @@ app.use((err, req, res, next) => {
 });
 
 const PORT = process.env.PORT || 5000;
+server.on('error', (error) => {
+  if (error?.code === 'EADDRINUSE') {
+    console.error(`Port ${PORT} is already in use.`);
+    console.error('Run "npm run port:check" to see which PID is listening.');
+    console.error('Run "npm run port:kill" to stop that process, then restart backend.');
+    process.exit(1);
+  }
+
+  console.error('Server startup failed:', error);
+  process.exit(1);
+});
+
 server.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
   startCronJobs();

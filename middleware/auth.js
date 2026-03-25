@@ -13,6 +13,9 @@ const normalizeUserRoles = (user) => {
   if (!activeRole) activeRole = roles[0] || null;
   if (activeRole && !roles.includes(activeRole)) roles.push(activeRole);
 
+  if (roles.includes('admin')) activeRole = 'admin';
+  else if (roles.includes('manager')) activeRole = 'manager';
+
   return { roles, activeRole };
 };
 

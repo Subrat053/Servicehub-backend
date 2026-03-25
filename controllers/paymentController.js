@@ -4,6 +4,7 @@ const ProviderProfile = require('../models/ProviderProfile');
 const RecruiterProfile = require('../models/RecruiterProfile');
 const RotationPool = require('../models/RotationPool');
 const { getStripeInstance, getPaymentConfig } = require('../utils/stripe');
+const { getExchangeRates } = require('../utils/exchangeRates');
 const { updateUserBadge } = require('../services/badgeService');
 const UserSubscription = require('../models/UserSubscription');
 const { createNotification } = require('../services/notificationService');
@@ -131,6 +132,74 @@ async function getProfileByPlanType(userId, planType) {
   return null;
 }
 
+const SUPPORTED_CHECKOUT_CURRENCIES = new Set(['INR', 'USD', 'AED']);
+const COUNTRY_TO_CURRENCY = {
+  IN: 'INR',
+  AE: 'AED',
+};
+
+const normalizeCountry = (value) => {
+  const code = String(value || '').trim().toUpperCase();
+  return /^[A-Z]{2}$/.test(code) ? code : '';
+};
+
+const normalizeCurrency = (value) => {
+  const code = String(value || '').trim().toUpperCase();
+  return /^[A-Z]{3}$/.test(code) ? code : '';
+};
+
+const resolveCheckoutMoney = async ({ plan, preferredCurrency, preferredCountry, userCurrency }) => {
+  const fallbackCurrency = normalizeCurrency(plan?.currency) || 'INR';
+  const countryCurrency = COUNTRY_TO_CURRENCY[normalizeCountry(preferredCountry)] || '';
+  const requestedCurrency = normalizeCurrency(preferredCurrency) || countryCurrency || normalizeCurrency(userCurrency) || fallbackCurrency;
+  const selectedCurrency = SUPPORTED_CHECKOUT_CURRENCIES.has(requestedCurrency) ? requestedCurrency : 'INR';
+
+  const baseInr = Number(plan?.price || 0);
+  const directUsd = Number(plan?.priceUSD || 0);
+  const directAed = Number(plan?.priceAED || 0);
+
+  if (selectedCurrency === 'INR') {
+    return {
+      amount: Number(baseInr.toFixed(2)),
+      currency: 'INR',
+      exchangeSource: 'plan-inr',
+    };
+  }
+
+  if (selectedCurrency === 'USD' && Number.isFinite(directUsd) && directUsd > 0) {
+    return {
+      amount: Number(directUsd.toFixed(2)),
+      currency: 'USD',
+      exchangeSource: 'plan-usd',
+    };
+  }
+
+  if (selectedCurrency === 'AED' && Number.isFinite(directAed) && directAed > 0) {
+    return {
+      amount: Number(directAed.toFixed(2)),
+      currency: 'AED',
+      exchangeSource: 'plan-aed',
+    };
+  }
+
+  const exchangeRates = await getExchangeRates();
+  if (selectedCurrency === 'USD') {
+    const converted = baseInr * Number(exchangeRates.INR_USD || 0);
+    return {
+      amount: Number(converted.toFixed(2)),
+      currency: 'USD',
+      exchangeSource: exchangeRates.source || 'exchange-rate',
+    };
+  }
+
+  const converted = baseInr * Number(exchangeRates.INR_AED || 0);
+  return {
+    amount: Number(converted.toFixed(2)),
+    currency: 'AED',
+    exchangeSource: exchangeRates.source || 'exchange-rate',
+  };
+};
+
 /**
  * @desc    Returns the Stripe publishable key + simulation mode flag
  * @route   GET /api/payments/config
@@ -156,7 +225,7 @@ const getPaymentPublicConfig = async (req, res) => {
  */
 const createOrder = async (req, res) => {
   try {
-    const { planId, successUrl, cancelUrl } = req.body;
+    const { planId, successUrl, cancelUrl, preferredCurrency, preferredCountry } = req.body;
     if (!planId) return res.status(400).json({ message: 'planId is required' });
 
     const plan = await Plan.findById(planId);
@@ -177,6 +246,12 @@ const createOrder = async (req, res) => {
     }
 
     const config = await getPaymentConfig();
+    const checkoutMoney = await resolveCheckoutMoney({
+      plan,
+      preferredCurrency,
+      preferredCountry,
+      userCurrency: req.user?.currency,
+    });
 
     // ---------------------------------------- SIMULATION MODE
     if (config.simulationMode) {
@@ -184,8 +259,8 @@ const createOrder = async (req, res) => {
       const payment = await Payment.create({
         user: req.user._id,
         plan: plan._id,
-        amount: plan.price,
-        currency: (plan.currency || 'INR').toUpperCase(),
+        amount: checkoutMoney.amount,
+        currency: checkoutMoney.currency,
         type: 'plan_purchase',
         status: 'completed',
         transactionId: simulatedTxnId,
@@ -193,7 +268,13 @@ const createOrder = async (req, res) => {
         stripePaymentIntentId: simulatedTxnId,
         isSimulated: true,
         paymentMethod: 'simulation',
-        metadata: { planName: plan.name, planSlug: plan.slug },
+        metadata: {
+          planName: plan.name,
+          planSlug: plan.slug,
+          exchangeSource: checkoutMoney.exchangeSource,
+          baseCurrency: (plan.currency || 'INR').toUpperCase(),
+          baseAmount: Number(plan.price || 0),
+        },
       });
 
       let profile;
@@ -218,8 +299,8 @@ const createOrder = async (req, res) => {
     const stripe = await getStripeInstance();
 
     // Stripe expects currency in lowercase, amount in smallest unit (paise for INR)
-    const currency = (plan.currency || 'inr').toLowerCase();
-    const unitAmount = Math.round(plan.price * 100);
+    const currency = checkoutMoney.currency.toLowerCase();
+    const unitAmount = Math.max(1, Math.round(Number(checkoutMoney.amount || 0) * 100));
 
     const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:5173';
     const planRoute = plan.type === 'recruiter' ? 'recruiter' : 'provider';
@@ -263,13 +344,19 @@ const createOrder = async (req, res) => {
     const payment = await Payment.create({
       user: req.user._id,
       plan: plan._id,
-      amount: plan.price,
+      amount: checkoutMoney.amount,
       currency: currency.toUpperCase(),
       type: 'plan_purchase',
       status: 'created',
       transactionId: session.id,
       stripeSessionId: session.id,
-      metadata: { planName: plan.name, planSlug: plan.slug },
+      metadata: {
+        planName: plan.name,
+        planSlug: plan.slug,
+        exchangeSource: checkoutMoney.exchangeSource,
+        baseCurrency: (plan.currency || 'INR').toUpperCase(),
+        baseAmount: Number(plan.price || 0),
+      },
     });
 
     res.json({

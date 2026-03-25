@@ -11,6 +11,7 @@ const {
 } = require('../controllers/jobController');
 const { protect, authorizeRoleFromActive } = require('../middleware/auth');
 const { checkApplyLimit, attachSubscription } = require('../middleware/subscription');
+const { ensureProviderApproved } = require('../middleware/providerApproval');
 
 // Optional auth: attach req.user if token present, but don't block
 const optionalAuth = async (req, res, next) => {
@@ -31,7 +32,7 @@ const optionalAuth = async (req, res, next) => {
 };
 
 // Provider: my applications (must come BEFORE the generic /:jobId routes)
-router.get('/my-applications', protect, authorizeRoleFromActive('provider'), getMyApplications);
+router.get('/my-applications', protect, authorizeRoleFromActive('provider'), ensureProviderApproved, getMyApplications);
 
 // Recruiter: view applications for a specific job
 router.get('/:jobId/applications', protect, authorizeRoleFromActive('recruiter'), getJobApplications);
@@ -43,6 +44,6 @@ router.put('/applications/:applicationId', protect, authorizeRoleFromActive('rec
 router.get('/', optionalAuth, attachSubscription, getAvailableJobs);
 
 // Provider: apply to job (with subscription limit check)
-router.post('/:jobId/apply', protect, authorizeRoleFromActive('provider'), checkApplyLimit, applyToJob);
+router.post('/:jobId/apply', protect, authorizeRoleFromActive('provider'), ensureProviderApproved, checkApplyLimit, applyToJob);
 
 module.exports = router;

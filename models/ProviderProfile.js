@@ -22,6 +22,11 @@ const providerProfileSchema = new mongoose.Schema({
   profileCompletion: { type: Number, default: 0 },
   isVerified: { type: Boolean, default: false },
   isApproved: { type: Boolean, default: false },
+  approvalAction: { type: String, enum: ['approved', 'rejected', 'pending'], default: 'pending' },
+  approvalNote: { type: String, default: '' },
+  approvedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
+  approvedByRole: { type: String, enum: ['admin', 'manager'], default: null },
+  approvedAt: { type: Date, default: null },
 
   // Plan & boost
   currentPlan: { type: String, enum: ['free', 'starter', 'business', 'enterprise', 'basic', 'pro', 'featured'], default: 'free' },

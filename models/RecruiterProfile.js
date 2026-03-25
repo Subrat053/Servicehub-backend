@@ -33,6 +33,11 @@ const recruiterProfileSchema = new mongoose.Schema({
   // Approval
   isApproved: { type: Boolean, default: false },
   isVerified: { type: Boolean, default: false },
+  approvalAction: { type: String, enum: ['approved', 'rejected', 'pending'], default: 'pending' },
+  approvalNote: { type: String, default: '' },
+  approvedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
+  approvedByRole: { type: String, enum: ['admin', 'manager'], default: null },
+  approvedAt: { type: Date, default: null },
 
   // WhatsApp
   whatsappAlerts: { type: Boolean, default: true },

@@ -6,10 +6,10 @@ const userSchema = new mongoose.Schema({
   email: { type: String, required: true, unique: true, lowercase: true, trim: true },
   phone: { type: String, default: '' },
   password: { type: String, minlength: 6 },
-  roles: [{ type: String, enum: ['provider', 'recruiter', 'admin'] }],
-  activeRole: { type: String, enum: ['provider', 'recruiter', 'admin'] },
+  roles: [{ type: String, enum: ['provider', 'recruiter', 'admin', 'manager'] }],
+  activeRole: { type: String, enum: ['provider', 'recruiter', 'admin', 'manager'] },
   // Legacy field kept temporarily for old records. Avoid using in new logic.
-  role: { type: String, enum: ['provider', 'recruiter', 'admin'], required: false, select: false },
+  role: { type: String, enum: ['provider', 'recruiter', 'admin', 'manager'], required: false, select: false },
   avatar: { type: String, default: '' },
   profilePhoto: { type: String, default: '' },
   authProvider: { type: String, enum: ['email', 'google', 'whatsapp'], default: 'email' },

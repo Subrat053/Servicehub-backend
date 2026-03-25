@@ -12,9 +12,11 @@ const WhatsappLog = require('../models/WhatsappLog');
 const Review = require('../models/Review');
 const VisitHistory = require('../models/VisitHistory');
 const UserSubscription = require('../models/UserSubscription');
+const ApprovalLog = require('../models/ApprovalLog');
 const { uploadToCloudinary, deleteFromCloudinary } = require('../utils/cloudinary');
 const path = require('path');
 const fs = require('fs');
+const crypto = require('crypto');
 
 const PLAN_TIERS = new Set(['starter', 'business', 'enterprise']);
 const LEGACY_PAID_TIERS = new Set(['basic', 'pro', 'featured']);
@@ -40,6 +42,74 @@ const derivePriceFromMonthly = (monthlyPrice, duration, discountPercent) => {
   const months = duration / 30;
   const discountedMultiplier = Math.max(0, 1 - (Number(discountPercent) || 0) / 100);
   return roundMoney(Number(monthlyPrice || 0) * months * discountedMultiplier);
+};
+
+const hasPrivilegedRole = (userLike) => {
+  if (!userLike) return false;
+  const roles = Array.isArray(userLike.roles) ? userLike.roles : [];
+  const activeRole = userLike.activeRole || userLike.role;
+  return roles.includes('admin') || roles.includes('manager') || activeRole === 'admin' || activeRole === 'manager';
+};
+
+const getExcludedModerationUserIds = async (actorId) => {
+  const privilegedUsers = await User.find({
+    $or: [
+      { roles: { $in: ['admin', 'manager'] } },
+      { activeRole: { $in: ['admin', 'manager'] } },
+      { role: { $in: ['admin', 'manager'] } },
+    ],
+  }).select('_id');
+
+  const ids = privilegedUsers.map((u) => u._id);
+  if (actorId) ids.push(actorId);
+  return ids;
+};
+
+const applyApprovalDecision = async ({ profileModel, profileId, approved, note, actor, targetType }) => {
+  const profile = await profileModel.findById(profileId).populate('user', 'name email phone roles activeRole role');
+  if (!profile) return null;
+
+  if (!profile.user) {
+    const error = new Error('Target user not found');
+    error.statusCode = 404;
+    throw error;
+  }
+
+  if (String(profile.user._id) === String(actor?._id)) {
+    const error = new Error('You cannot approve or reject your own profile.');
+    error.statusCode = 403;
+    throw error;
+  }
+
+  if (hasPrivilegedRole(profile.user)) {
+    const error = new Error('Admin/manager profiles are not eligible for approval actions.');
+    error.statusCode = 400;
+    throw error;
+  }
+
+  const isApproved = approved !== false;
+  profile.isApproved = isApproved;
+  profile.isVerified = isApproved;
+  profile.approvalAction = isApproved ? 'approved' : 'rejected';
+  profile.approvalNote = typeof note === 'string' ? note.trim() : '';
+  profile.approvedBy = actor?._id || null;
+  profile.approvedByRole = actor?.activeRole || actor?.role || null;
+  profile.approvedAt = new Date();
+  await profile.save();
+
+  await ApprovalLog.create({
+    targetType,
+    targetProfileId: profile._id,
+    targetUserId: profile.user?._id,
+    targetName: profile.user?.name || '',
+    action: isApproved ? 'approved' : 'rejected',
+    note: profile.approvalNote,
+    actorId: actor?._id,
+    actorName: actor?.name || '',
+    actorRole: actor?.activeRole || actor?.role || 'admin',
+  });
+
+  return profile;
 };
 
 const syncTierPlanFamily = async ({ payload, currentPlan }) => {
@@ -206,15 +276,20 @@ const toggleBlockUser = async (req, res) => {
 // @route   PUT /api/admin/providers/:id/approve
 const approveProvider = async (req, res) => {
   try {
-    const { approved } = req.body;
-    const profile = await ProviderProfile.findById(req.params.id);
+    const { approved, note } = req.body;
+    const profile = await applyApprovalDecision({
+      profileModel: ProviderProfile,
+      profileId: req.params.id,
+      approved,
+      note,
+      actor: req.user,
+      targetType: 'provider',
+    });
     if (!profile) return res.status(404).json({ message: 'Provider not found' });
-    profile.isApproved = approved !== false;
-    profile.isVerified = approved !== false;
-    await profile.save();
     res.json({ message: `Provider ${profile.isApproved ? 'approved' : 'rejected'}`, profile });
   } catch (error) {
-    res.status(500).json({ message: 'Server error', error: error.message });
+    const statusCode = error.statusCode || 500;
+    res.status(statusCode).json({ message: error.message || 'Server error', error: error.message });
   }
 };
 
@@ -222,13 +297,152 @@ const approveProvider = async (req, res) => {
 // @route   PUT /api/admin/recruiters/:id/approve
 const approveRecruiter = async (req, res) => {
   try {
-    const { approved } = req.body;
-    const profile = await RecruiterProfile.findById(req.params.id);
+    const { approved, note } = req.body;
+    const profile = await applyApprovalDecision({
+      profileModel: RecruiterProfile,
+      profileId: req.params.id,
+      approved,
+      note,
+      actor: req.user,
+      targetType: 'recruiter',
+    });
     if (!profile) return res.status(404).json({ message: 'Recruiter not found' });
-    profile.isApproved = approved !== false;
-    profile.isVerified = approved !== false;
-    await profile.save();
     res.json({ message: `Recruiter ${profile.isApproved ? 'approved' : 'rejected'}`, profile });
+  } catch (error) {
+    const statusCode = error.statusCode || 500;
+    res.status(statusCode).json({ message: error.message || 'Server error', error: error.message });
+  }
+};
+
+// @desc    Create manager (admin only)
+// @route   POST /api/admin/managers
+const createManager = async (req, res) => {
+  try {
+    const { name, email, phone, password } = req.body || {};
+    const normalizedEmail = String(email || '').trim().toLowerCase();
+    if (!name || !normalizedEmail) {
+      return res.status(400).json({ message: 'name and email are required' });
+    }
+
+    const existing = await User.findOne({ email: normalizedEmail }).select('+role');
+    if (existing) {
+      return res.status(400).json({ message: 'Email already exists' });
+    }
+
+    const generatedPassword = password || crypto.randomBytes(6).toString('base64url');
+
+    const manager = await User.create({
+      name,
+      email: normalizedEmail,
+      phone: phone || '',
+      password: generatedPassword,
+      roles: ['manager'],
+      activeRole: 'manager',
+      role: 'manager',
+      authProvider: 'email',
+      isEmailVerified: true,
+      termsAccepted: true,
+      locale: 'en',
+      preferredLanguage: 'en',
+      country: 'US',
+      currency: 'USD',
+    });
+
+    res.status(201).json({
+      message: 'Manager created successfully',
+      manager: {
+        _id: manager._id,
+        name: manager.name,
+        email: manager.email,
+        phone: manager.phone,
+        roles: manager.roles,
+        activeRole: manager.activeRole,
+        createdAt: manager.createdAt,
+      },
+      generatedPassword: password ? undefined : generatedPassword,
+    });
+  } catch (error) {
+    res.status(500).json({ message: 'Server error', error: error.message });
+  }
+};
+
+// @desc    List managers (admin only)
+// @route   GET /api/admin/managers
+const getManagers = async (req, res) => {
+  try {
+    const managers = await User.find({
+      $or: [
+        { activeRole: 'manager' },
+        { role: 'manager' },
+        { roles: 'manager' },
+      ],
+    })
+      .select('name email phone isBlocked activeRole roles createdAt lastLogin')
+      .sort({ createdAt: -1 });
+
+    res.json({ managers });
+  } catch (error) {
+    res.status(500).json({ message: 'Server error', error: error.message });
+  }
+};
+
+// @desc    Delete manager (admin only)
+// @route   DELETE /api/admin/managers/:id
+const deleteManager = async (req, res) => {
+  try {
+    if (String(req.user?._id) === String(req.params.id)) {
+      return res.status(400).json({ message: 'Admin cannot remove own account' });
+    }
+
+    const manager = await User.findById(req.params.id).select('+role');
+    if (!manager) return res.status(404).json({ message: 'Manager not found' });
+
+    const roles = Array.isArray(manager.roles) ? manager.roles : [];
+    const activeRole = manager.activeRole || manager.role;
+    const isManager = roles.includes('manager') || activeRole === 'manager' || manager.role === 'manager';
+    if (!isManager) {
+      return res.status(400).json({ message: 'Target user is not a manager account' });
+    }
+
+    await User.findByIdAndDelete(manager._id);
+
+    res.json({ message: 'Manager deleted successfully' });
+  } catch (error) {
+    res.status(500).json({ message: 'Server error', error: error.message });
+  }
+};
+
+// @desc    Approval audit log (admin only)
+// @route   GET /api/admin/approval-logs
+const getApprovalLogs = async (req, res) => {
+  try {
+    const { actorId, targetType, action, page = 1, limit = 50 } = req.query;
+    const filter = {};
+    if (actorId) filter.actorId = actorId;
+    if (targetType) filter.targetType = targetType;
+    if (action) filter.action = action;
+
+    const pageNum = Math.max(1, parseInt(page, 10) || 1);
+    const limitNum = Math.min(100, Math.max(1, parseInt(limit, 10) || 50));
+
+    const [logs, total] = await Promise.all([
+      ApprovalLog.find(filter)
+        .sort({ createdAt: -1 })
+        .skip((pageNum - 1) * limitNum)
+        .limit(limitNum)
+        .lean(),
+      ApprovalLog.countDocuments(filter),
+    ]);
+
+    res.json({
+      logs,
+      pagination: {
+        page: pageNum,
+        limit: limitNum,
+        total,
+        pages: Math.ceil(total / limitNum),
+      },
+    });
   } catch (error) {
     res.status(500).json({ message: 'Server error', error: error.message });
   }
@@ -240,6 +454,9 @@ const getProviders = async (req, res) => {
   try {
     const { page = 1, limit = 20, approved, search } = req.query;
     const filter = {};
+    const excludedUserIds = await getExcludedModerationUserIds(req.user?._id);
+    filter.user = { $nin: excludedUserIds };
+
     if (approved === 'true') filter.isApproved = true;
     if (approved === 'false') filter.isApproved = false;
     if (search) {
@@ -253,6 +470,7 @@ const getProviders = async (req, res) => {
 
     const providers = await ProviderProfile.find(filter)
       .populate('user', 'name email phone')
+      .populate('approvedBy', 'name email activeRole role')
       .sort({ createdAt: -1 })
       .skip((parseInt(page) - 1) * parseInt(limit))
       .limit(parseInt(limit));
@@ -270,6 +488,9 @@ const getRecruiters = async (req, res) => {
   try {
     const { page = 1, limit = 20, approved, search } = req.query;
     const filter = {};
+    const excludedUserIds = await getExcludedModerationUserIds(req.user?._id);
+    filter.user = { $nin: excludedUserIds };
+
     if (approved === 'true') filter.isApproved = true;
     if (approved === 'false') filter.isApproved = false;
     if (search) {
@@ -284,6 +505,7 @@ const getRecruiters = async (req, res) => {
 
     const recruiters = await RecruiterProfile.find(filter)
       .populate('user', 'name email phone')
+      .populate('approvedBy', 'name email activeRole role')
       .sort({ createdAt: -1 })
       .skip((parseInt(page) - 1) * parseInt(limit))
       .limit(parseInt(limit));
@@ -990,6 +1212,10 @@ module.exports = {
   getUsers,
   getUserDetail,
   toggleBlockUser,
+  createManager,
+  getManagers,
+  deleteManager,
+  getApprovalLogs,
   approveProvider,
   approveRecruiter,
   getProviders,

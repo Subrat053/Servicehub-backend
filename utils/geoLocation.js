@@ -69,6 +69,23 @@ function extractIpFromRequest(req) {
   return String(raw).replace(/^::ffff:/i, '');
 }
 
+function extractCountryFromAcceptLanguage(headerValue) {
+  const value = String(headerValue || '').trim();
+  if (!value) return '';
+
+  const parts = value.split(',').map((item) => item.trim()).filter(Boolean);
+  for (const part of parts) {
+    const langTag = part.split(';')[0].trim();
+    if (!langTag) continue;
+    const segments = langTag.split('-');
+    if (segments.length < 2) continue;
+    const country = normalizeCountryCode(segments[segments.length - 1]);
+    if (country) return country;
+  }
+
+  return '';
+}
+
 async function fetchGeoFromIpApi(ip) {
   const endpoint = `https://ipapi.co/${encodeURIComponent(ip)}/json/`;
   const controller = new AbortController();
@@ -95,6 +112,7 @@ async function fetchGeoFromIpApi(ip) {
 
 async function detectLocaleFromRequest(req) {
   const countryFromEdge = normalizeCountryCode(req.headers['cf-ipcountry'] || req.headers['x-vercel-ip-country']);
+  const countryFromLanguage = extractCountryFromAcceptLanguage(req.headers['accept-language']);
   const ip = extractIpFromRequest(req);
 
   let detected = {
@@ -119,15 +137,16 @@ async function detectLocaleFromRequest(req) {
   }
 
   const finalCountry = detected.country || 'US';
-  const finalCurrency = detected.currency || COUNTRY_CURRENCY_FALLBACK[finalCountry] || 'USD';
-  const finalLocale = detected.locale || COUNTRY_LANGUAGE_FALLBACK[finalCountry] || 'en';
+  const resolvedCountry = finalCountry === 'US' && countryFromLanguage ? countryFromLanguage : finalCountry;
+  const finalCurrency = detected.currency || COUNTRY_CURRENCY_FALLBACK[resolvedCountry] || 'USD';
+  const finalLocale = detected.locale || COUNTRY_LANGUAGE_FALLBACK[resolvedCountry] || 'en';
 
   return {
-    country: finalCountry,
+    country: resolvedCountry,
     currency: finalCurrency,
     locale: finalLocale,
     ip: detected.ip,
-    source: detected.source,
+    source: resolvedCountry !== finalCountry ? 'accept-language' : detected.source,
   };
 }
 

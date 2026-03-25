@@ -194,6 +194,18 @@ const updateProfile = async (req, res) => {
 // Escape special regex characters in user input
 const escapeRegex = (str) => str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
+const findProviderProfileByParam = async (providerParam) => {
+  let profile = await ProviderProfile.findById(providerParam)
+    .populate('user', 'name email phone avatar whatsappNumber _id');
+
+  if (!profile) {
+    profile = await ProviderProfile.findOne({ user: providerParam })
+      .populate('user', 'name email phone avatar whatsappNumber _id');
+  }
+
+  return profile;
+};
+
 // @desc    Search providers
 // @route   GET /api/recruiter/search?skill=&city=&rating=&experience=&verified=&page=&limit=
 const searchProviders = async (req, res) => {
@@ -214,6 +226,7 @@ const searchProviders = async (req, res) => {
     } = req.query;
 
     const skillTerm = String(skill || category || '').trim();
+    const cityTerm = String(city || '').trim();
     const pageNum = Math.max(1, parseInt(page, 10) || 1);
     const limitNum = Math.max(1, parseInt(limit, 10) || 20);
     const featuredLimit = Math.max(1, parseInt(process.env.FEATURED_LIMIT || 5, 10));
@@ -237,9 +250,9 @@ const searchProviders = async (req, res) => {
     const filter = {};
     // Skill: substring match (e.g. "Tutor" matches "Online tutor")
     if (skillTerm) filter.skills = { $regex: escapeRegex(skillTerm), $options: 'i' };
-    if (city) {
+    if (cityTerm) {
       // City: prefix-tolerant regex – trims 1 trailing char to absorb typos like "Kolkataa" → "Kolkata"
-      const cityQuery = city.trim();
+      const cityQuery = cityTerm;
       const cityPrefix = cityQuery.length > 4
         ? cityQuery.slice(0, cityQuery.length - 1)
         : cityQuery;
@@ -259,7 +272,7 @@ const searchProviders = async (req, res) => {
 
     // 2-pass fallback: if skill+city combo returns 0, retry with skill only
     // (city may have a typo that prefix-regex couldn't absorb)
-    if (candidates.length === 0 && skillTerm && city) {
+    if (candidates.length === 0 && skillTerm && cityTerm) {
       const skillOnlyFilter = { isApproved: true, skills: { $regex: escapeRegex(skillTerm), $options: 'i' } };
       if (tier) skillOnlyFilter.tier = tier;
       if (rating) skillOnlyFilter.rating = { $gte: parseFloat(rating) };
@@ -293,39 +306,51 @@ const searchProviders = async (req, res) => {
     // Keep legacy rotation key for backward compatibility.
     const rotationProviders = featured;
 
-    if (skillTerm || city) {
-      await RotationPool.findOneAndUpdate(
-        { skill: (skillTerm || 'any').toLowerCase(), city: (city || 'any').toLowerCase() },
-        {
-          $setOnInsert: {
-            skill: (skillTerm || 'any').toLowerCase(),
-            city: (city || 'any').toLowerCase(),
-            maxPoolSize: featuredLimit,
-            rotationInterval: rotationIntervalSec,
+    if (skillTerm || cityTerm) {
+      try {
+        await RotationPool.findOneAndUpdate(
+          { skill: (skillTerm || 'any').toLowerCase(), city: (cityTerm || 'any').toLowerCase() },
+          {
+            $setOnInsert: {
+              skill: (skillTerm || 'any').toLowerCase(),
+              city: (cityTerm || 'any').toLowerCase(),
+              maxPoolSize: featuredLimit,
+              rotationInterval: rotationIntervalSec,
+            },
+            $set: { rotationInterval: rotationIntervalSec, maxPoolSize: featuredLimit },
           },
-          $set: { rotationInterval: rotationIntervalSec, maxPoolSize: featuredLimit },
-        },
-        { upsert: true, new: false }
-      );
+          { upsert: true, new: false }
+        );
+      } catch (poolErr) {
+        console.warn('Rotation pool update failed:', poolErr.message);
+      }
     }
 
     // Track recruiter free view + save search history
     if (req.user && req.user.activeRole === 'recruiter') {
-      const recruiterProfile = await RecruiterProfile.findOne({ user: req.user._id });
-      if (recruiterProfile) {
-        recruiterProfile.freeProfileViews += 1;
-        await recruiterProfile.save();
+      try {
+        const recruiterProfile = await RecruiterProfile.findOne({ user: req.user._id });
+        if (recruiterProfile) {
+          recruiterProfile.freeProfileViews = Number(recruiterProfile.freeProfileViews || 0) + 1;
+          await recruiterProfile.save();
+        }
+      } catch (profileErr) {
+        console.warn('Recruiter search counters update failed:', profileErr.message);
       }
 
       // Save search history
-      if (skillTerm || city) {
-        await VisitHistory.create({
-          user: req.user._id,
-          type: 'search',
-          searchQuery: [skillTerm, city].filter(Boolean).join(' in '),
-          searchCity: city || '',
-          searchSkill: skillTerm || '',
-        });
+      if (skillTerm || cityTerm) {
+        try {
+          await VisitHistory.create({
+            user: req.user._id,
+            type: 'search',
+            searchQuery: [skillTerm, cityTerm].filter(Boolean).join(' in '),
+            searchCity: cityTerm || '',
+            searchSkill: skillTerm || '',
+          });
+        } catch (historyErr) {
+          console.warn('Recruiter search history write failed:', historyErr.message);
+        }
       }
     }
 
@@ -368,8 +393,7 @@ const viewProvider = async (req, res) => {
       });
     }
 
-    const provider = await ProviderProfile.findById(req.params.id)
-      .populate('user', 'name avatar email phone whatsappNumber');
+    const provider = await findProviderProfileByParam(req.params.id);
     if (!provider) return res.status(404).json({ message: 'Provider not found' });
 
     // Check if already unlocked
@@ -461,8 +485,7 @@ const unlockContact = async (req, res) => {
     const recruiterProfile = await RecruiterProfile.findOne({ user: req.user._id });
     if (!recruiterProfile) return res.status(404).json({ message: 'Profile not found' });
 
-    const providerProfile = await ProviderProfile.findById(req.params.providerId)
-      .populate('user', 'name email phone avatar whatsappNumber');
+    const providerProfile = await findProviderProfileByParam(req.params.providerId);
     if (!providerProfile) return res.status(404).json({ message: 'Provider not found' });
 
     // Check if already unlocked
@@ -881,7 +904,7 @@ const checkUnlockStatus = async (req, res) => {
       await ensureRecruiterMonthlyFreeQuota(recruiterProfile);
     }
 
-    const provider = await ProviderProfile.findById(req.params.providerId).populate('user', '_id');
+    const provider = await findProviderProfileByParam(req.params.providerId);
     if (!provider) return res.status(404).json({ message: 'Provider not found' });
 
     const existing = await Lead.findOne({
@@ -891,7 +914,15 @@ const checkUnlockStatus = async (req, res) => {
       isUnlocked: true,
     });
 
-    res.json({ isUnlocked: !!existing });
+    const contactInfo = existing
+      ? {
+          phone: provider.user?.phone || '',
+          email: provider.user?.email || '',
+          whatsappNumber: provider.user?.whatsappNumber || provider.user?.phone || '',
+        }
+      : null;
+
+    res.json({ isUnlocked: !!existing, contactInfo });
   } catch (error) {
     res.status(500).json({ message: 'Server error', error: error.message });
   }
